@@ -69,10 +69,7 @@ mod tests {
         snapshot_package::{
             AccountsPackage, PendingSnapshotPackage, SnapshotPackage, SnapshotType,
         },
-        snapshot_utils::{
-            self, ArchiveFormat, SnapshotVersion, DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN,
-            DEFAULT_MAX_INCREMENTAL_SNAPSHOT_ARCHIVES_TO_RETAIN,
-        },
+        snapshot_utils::{self, ArchiveFormat, SnapshotVersion},
         status_cache::MAX_CACHE_ENTRIES,
     };
     use solana_sdk::{
@@ -146,12 +143,8 @@ mod tests {
                 incremental_snapshot_archive_interval_slots,
                 snapshot_archives_dir: snapshot_archives_dir.path().to_path_buf(),
                 bank_snapshots_dir: bank_snapshots_dir.path().to_path_buf(),
-                archive_format: ArchiveFormat::TarBzip2,
                 snapshot_version,
-                maximum_full_snapshot_archives_to_retain:
-                    DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN,
-                maximum_incremental_snapshot_archives_to_retain:
-                    DEFAULT_MAX_INCREMENTAL_SNAPSHOT_ARCHIVES_TO_RETAIN,
+                ..SnapshotConfig::default()
             };
             bank_forks.set_snapshot_config(Some(snapshot_config.clone()));
             SnapshotTestConfig {
@@ -210,6 +203,7 @@ mod tests {
             false,
             false,
             Some(ACCOUNTS_DB_CONFIG_FOR_TESTING),
+            None,
         )
         .unwrap();
 
@@ -845,6 +839,7 @@ mod tests {
             false,
             false,
             Some(ACCOUNTS_DB_CONFIG_FOR_TESTING),
+            None,
         )?;
 
         assert_eq!(bank, &deserialized_bank);
@@ -935,6 +930,7 @@ mod tests {
             snapshot_test_config.snapshot_config.clone(),
         );
 
+        let tmpdir = TempDir::new().unwrap();
         let accounts_hash_verifier = AccountsHashVerifier::new(
             accounts_package_receiver,
             Some(pending_snapshot_package),
@@ -944,6 +940,7 @@ mod tests {
             false,
             0,
             Some(snapshot_test_config.snapshot_config.clone()),
+            tmpdir.path().to_path_buf(),
         );
 
         let accounts_background_service = AccountsBackgroundService::new(
@@ -1021,6 +1018,7 @@ mod tests {
             false,
             false,
             Some(ACCOUNTS_DB_CONFIG_FOR_TESTING),
+            None,
         )
         .unwrap();
 

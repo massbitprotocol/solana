@@ -41,7 +41,6 @@ module.exports = {
       "cli/choose-a-cluster",
       "cli/transfer-tokens",
       "cli/delegate-stake",
-      "cli/manage-stake-accounts",
       "cli/deploy-a-program",
       "offline-signing",
       "offline-signing/durable-nonce",
@@ -65,6 +64,7 @@ module.exports = {
         items: [
           "developing/clients/jsonrpc-api",
           "developing/clients/javascript-api",
+          "developing/clients/javascript-reference",
           "developing/clients/rust-api",
         ],
       },

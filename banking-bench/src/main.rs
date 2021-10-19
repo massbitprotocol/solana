@@ -4,7 +4,7 @@ use crossbeam_channel::unbounded;
 use log::*;
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
-use solana_core::{banking_stage::BankingStage, cost_model::CostModel, cost_tracker::CostTracker};
+use solana_core::banking_stage::BankingStage;
 use solana_gossip::{cluster_info::ClusterInfo, cluster_info::Node};
 use solana_ledger::{
     blockstore::Blockstore,
@@ -16,6 +16,7 @@ use solana_perf::packet::to_packets_chunked;
 use solana_poh::poh_recorder::{create_test_recorder, PohRecorder, WorkingBankEntry};
 use solana_runtime::{
     accounts_background_service::AbsRequestSender, bank::Bank, bank_forks::BankForks,
+    cost_model::CostModel, cost_tracker::CostTracker,
 };
 use solana_sdk::{
     hash::Hash,
@@ -166,6 +167,7 @@ fn main() {
 
     let (verified_sender, verified_receiver) = unbounded();
     let (vote_sender, vote_receiver) = unbounded();
+    let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
     let (replay_vote_sender, _replay_vote_receiver) = unbounded();
     let bank0 = Bank::new_for_benches(&genesis_config);
     let mut bank_forks = BankForks::new(bank0);
@@ -227,6 +229,7 @@ fn main() {
             &cluster_info,
             &poh_recorder,
             verified_receiver,
+            tpu_vote_receiver,
             vote_receiver,
             None,
             replay_vote_sender,
@@ -312,11 +315,10 @@ fn main() {
                 tx_total_us += duration_as_us(&now.elapsed());
 
                 let mut poh_time = Measure::start("poh_time");
-                poh_recorder.lock().unwrap().reset(
-                    bank.last_blockhash(),
-                    bank.slot(),
-                    Some((bank.slot(), bank.slot() + 1)),
-                );
+                poh_recorder
+                    .lock()
+                    .unwrap()
+                    .reset(bank.clone(), Some((bank.slot(), bank.slot() + 1)));
                 poh_time.stop();
 
                 let mut new_bank_time = Measure::start("new_bank");
@@ -385,6 +387,7 @@ fn main() {
         );
 
         drop(verified_sender);
+        drop(tpu_vote_sender);
         drop(vote_sender);
         exit.store(true, Ordering::Relaxed);
         banking_stage.join().unwrap();

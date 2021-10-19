@@ -350,7 +350,10 @@ impl ClusterInfoVoteListener {
         labels: Vec<CrdsValueLabel>,
     ) -> (Vec<Transaction>, Vec<(CrdsValueLabel, Slot, Packets)>) {
         let mut msgs = packet::to_packets_chunked(&votes, 1);
-        sigverify::ed25519_verify_cpu(&mut msgs);
+
+        // Votes should already be filtered by this point.
+        let reject_non_vote = false;
+        sigverify::ed25519_verify_cpu(&mut msgs, reject_non_vote);
 
         let (vote_txs, packets) = izip!(labels.into_iter(), votes.into_iter(), msgs,)
             .filter_map(|(label, vote, packet)| {
@@ -1530,7 +1533,7 @@ mod tests {
         let vote_tracker = VoteTracker::new(&bank);
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
-        let subscriptions = Arc::new(RpcSubscriptions::new(
+        let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             &exit,
             bank_forks,
             Arc::new(RwLock::new(BlockCommitmentCache::default())),
@@ -1649,7 +1652,7 @@ mod tests {
         let bank = bank_forks.read().unwrap().get(0).unwrap().clone();
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
-        let subscriptions = Arc::new(RpcSubscriptions::new(
+        let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             &exit,
             bank_forks,
             Arc::new(RwLock::new(BlockCommitmentCache::default())),

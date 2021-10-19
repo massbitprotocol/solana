@@ -308,6 +308,12 @@ pub enum CliCommand {
         withdraw_amount: SpendAmount,
         memo: Option<String>,
     },
+    CloseVoteAccount {
+        vote_account_pubkey: Pubkey,
+        destination_account_pubkey: Pubkey,
+        withdraw_authority: SignerIndex,
+        memo: Option<String>,
+    },
     VoteAuthorize {
         vote_account_pubkey: Pubkey,
         new_authorized_pubkey: Pubkey,
@@ -809,6 +815,9 @@ pub fn parse_command(
         ("vote-account", Some(matches)) => parse_vote_get_account_command(matches, wallet_manager),
         ("withdraw-from-vote-account", Some(matches)) => {
             parse_withdraw_from_vote_account(matches, default_signer, wallet_manager)
+        }
+        ("close-vote-account", Some(matches)) => {
+            parse_close_vote_account(matches, default_signer, wallet_manager)
         }
         // Wallet Commands
         ("account", Some(matches)) => parse_account(matches, wallet_manager),
@@ -1409,6 +1418,19 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             destination_account_pubkey,
             memo.as_ref(),
         ),
+        CliCommand::CloseVoteAccount {
+            vote_account_pubkey,
+            withdraw_authority,
+            destination_account_pubkey,
+            memo,
+        } => process_close_vote_account(
+            &rpc_client,
+            config,
+            vote_account_pubkey,
+            *withdraw_authority,
+            destination_account_pubkey,
+            memo.as_ref(),
+        ),
         CliCommand::VoteAuthorize {
             vote_account_pubkey,
             new_authorized_pubkey,
@@ -1951,17 +1973,36 @@ mod tests {
         let result = process_command(&config);
         assert!(result.is_ok());
 
+        let vote_account_info_response = json!(Response {
+            context: RpcResponseContext { slot: 1 },
+            value: json!({
+                "data": ["KLUv/QBYNQIAtAIBAAAAbnoc3Smwt4/ROvTFWY/v9O8qlxZuPKby5Pv8zYBQW/EFAAEAAB8ACQD6gx92zAiAAecDP4B2XeEBSIx7MQeung==", "base64+zstd"],
+                "lamports": 42,
+                "owner": "Vote111111111111111111111111111111111111111",
+                "executable": false,
+                "rentEpoch": 1,
+            }),
+        });
+        let mut mocks = HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, vote_account_info_response);
+        let rpc_client = RpcClient::new_mock_with_mocks("".to_string(), mocks);
+        let mut vote_config = CliConfig {
+            rpc_client: Some(Arc::new(rpc_client)),
+            json_rpc_url: "http://127.0.0.1:8899".to_string(),
+            ..CliConfig::default()
+        };
+        let current_authority = keypair_from_seed(&[5; 32]).unwrap();
         let new_authorized_pubkey = solana_sdk::pubkey::new_rand();
-        config.signers = vec![&bob_keypair];
-        config.command = CliCommand::VoteAuthorize {
+        vote_config.signers = vec![&current_authority];
+        vote_config.command = CliCommand::VoteAuthorize {
             vote_account_pubkey: bob_pubkey,
             new_authorized_pubkey,
-            vote_authorize: VoteAuthorize::Voter,
+            vote_authorize: VoteAuthorize::Withdrawer,
             memo: None,
             authorized: 0,
             new_authorized: None,
         };
-        let result = process_command(&config);
+        let result = process_command(&vote_config);
         assert!(result.is_ok());
 
         let new_identity_keypair = Keypair::new();

@@ -11,7 +11,7 @@ use {
 
 crate::declare_id!("ComputeBudget111111111111111111111111111111");
 
-const MAX_UNITS: u64 = 1_000_000;
+const MAX_UNITS: u32 = 1_000_000;
 
 /// Compute Budget Instructions
 #[derive(
@@ -29,11 +29,11 @@ const MAX_UNITS: u64 = 1_000_000;
 pub enum ComputeBudgetInstruction {
     /// Request a specific maximum number of compute units the transaction is
     /// allowed to consume.
-    RequestUnits(u64),
+    RequestUnits(u32),
 }
 impl ComputeBudgetInstruction {
     /// Create a `ComputeBudgetInstruction::RequestUnits` `Instruction`
-    pub fn request_units(units: u64) -> Instruction {
+    pub fn request_units(units: u32) -> Instruction {
         Instruction::new_with_borsh(id(), &ComputeBudgetInstruction::RequestUnits(units), vec![])
     }
 }
@@ -70,6 +70,8 @@ pub struct ComputeBudget {
     pub sysvar_base_cost: u64,
     /// Number of compute units consumed to call secp256k1_recover
     pub secp256k1_recover_cost: u64,
+    /// Number of compute units consumed to do a syscall without any work
+    pub syscall_base_cost: u64,
     /// Optional program heap region size, if `None` then loader default
     pub heap_size: Option<usize>,
 }
@@ -95,6 +97,7 @@ impl ComputeBudget {
             cpi_bytes_per_unit: 250,        // ~50MB at 200,000 units
             sysvar_base_cost: 100,
             secp256k1_recover_cost: 25_000,
+            syscall_base_cost: 100,
             heap_size: None,
         }
     }
@@ -112,7 +115,7 @@ impl ComputeBudget {
                 if units > MAX_UNITS {
                     return Err(error);
                 }
-                self.max_units = units;
+                self.max_units = units as u64;
             }
         }
         Ok(())
@@ -200,7 +203,7 @@ mod tests {
         assert_eq!(
             compute_budget,
             ComputeBudget {
-                max_units: MAX_UNITS,
+                max_units: MAX_UNITS as u64,
                 ..ComputeBudget::default()
             }
         );

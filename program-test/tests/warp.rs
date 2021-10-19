@@ -1,9 +1,10 @@
 #![allow(clippy::integer_arithmetic)]
 use {
-    assert_matches::assert_matches,
     bincode::deserialize,
     solana_banks_client::BanksClient,
-    solana_program_test::{processor, ProgramTest, ProgramTestContext, ProgramTestError},
+    solana_program_test::{
+        processor, ProgramTest, ProgramTestBanksClientExt, ProgramTestContext, ProgramTestError,
+    },
     solana_sdk::{
         account_info::{next_account_info, AccountInfo},
         clock::Clock,
@@ -15,7 +16,7 @@ use {
         signature::{Keypair, Signer},
         stake::{
             instruction as stake_instruction,
-            state::{Authorized, Lockup, StakeState},
+            state::{Authorized, Lockup, StakeActivationStatus, StakeState},
         },
         system_instruction, system_program,
         sysvar::{
@@ -298,11 +299,11 @@ async fn stake_rewards_from_warp() {
     let stake_history: StakeHistory = deserialize(&stake_history_account.data).unwrap();
     let clock: Clock = deserialize(&clock_account.data).unwrap();
     let stake = stake_state.stake().unwrap();
-    assert_matches!(
+    assert_eq!(
         stake
             .delegation
             .stake_activating_and_deactivating(clock.epoch, Some(&stake_history)),
-        (_, 0, 0)
+        StakeActivationStatus::with_effective(stake.delegation.stake),
     );
 }
 
@@ -413,4 +414,33 @@ async fn stake_merge_immediately_after_activation() {
         .process_transaction(transaction)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn get_blockhash_post_warp() {
+    let program_test = ProgramTest::default();
+    let mut context = program_test.start_with_context().await;
+
+    let new_blockhash = context
+        .banks_client
+        .get_new_blockhash(&context.last_blockhash)
+        .await
+        .unwrap()
+        .0;
+    let mut tx = Transaction::new_with_payer(&[], Some(&context.payer.pubkey()));
+    tx.sign(&[&context.payer], new_blockhash);
+    context.banks_client.process_transaction(tx).await.unwrap();
+
+    context.warp_to_slot(10).unwrap();
+
+    let new_blockhash = context
+        .banks_client
+        .get_new_blockhash(&context.last_blockhash)
+        .await
+        .unwrap()
+        .0;
+
+    let mut tx = Transaction::new_with_payer(&[], Some(&context.payer.pubkey()));
+    tx.sign(&[&context.payer], new_blockhash);
+    context.banks_client.process_transaction(tx).await.unwrap();
 }

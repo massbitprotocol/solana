@@ -1,7 +1,6 @@
 use crate::{
-    block_cost_limits::*, block_error::BlockError, blockstore::Blockstore,
-    blockstore_db::BlockstoreError, blockstore_meta::SlotMeta,
-    leader_schedule_cache::LeaderScheduleCache,
+    block_error::BlockError, blockstore::Blockstore, blockstore_db::BlockstoreError,
+    blockstore_meta::SlotMeta, leader_schedule_cache::LeaderScheduleCache,
 };
 use chrono_humanize::{Accuracy, HumanTime, Tense};
 use crossbeam_channel::Sender;
@@ -18,12 +17,14 @@ use solana_rayon_threadlimit::get_thread_count;
 use solana_runtime::{
     accounts_db::{AccountShrinkThreshold, AccountsDbConfig},
     accounts_index::AccountSecondaryIndexes,
+    accounts_update_notifier_interface::AccountsUpdateNotifier,
     bank::{
         Bank, ExecuteTimings, InnerInstructionsList, RentDebits, TransactionBalancesSet,
         TransactionExecutionResult, TransactionLogMessages, TransactionResults,
     },
     bank_forks::BankForks,
     bank_utils,
+    block_cost_limits::*,
     commitment::VOTE_THRESHOLD_SIZE,
     snapshot_config::SnapshotConfig,
     snapshot_package::{AccountsPackageSender, SnapshotType},
@@ -65,7 +66,7 @@ pub struct BlockCostCapacityMeter {
 
 impl Default for BlockCostCapacityMeter {
     fn default() -> Self {
-        BlockCostCapacityMeter::new(BLOCK_COST_MAX)
+        BlockCostCapacityMeter::new(MAX_BLOCK_UNITS)
     }
 }
 
@@ -142,7 +143,8 @@ fn aggregate_total_execution_units(execute_timings: &ExecuteTimings) -> u64 {
         if timing.count < 1 {
             continue;
         }
-        execute_cost_units += timing.accumulated_units / timing.count as u64;
+        execute_cost_units =
+            execute_cost_units.saturating_add(timing.accumulated_units / timing.count as u64);
         trace!("aggregated execution cost of {:?} {:?}", program_id, timing);
     }
     execute_cost_units
@@ -483,6 +485,7 @@ pub fn process_blockstore(
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
     snapshot_config: Option<&SnapshotConfig>,
     accounts_package_sender: AccountsPackageSender,
+    accounts_update_notifier: Option<AccountsUpdateNotifier>,
 ) -> BlockstoreProcessorResult {
     if let Some(num_threads) = opts.override_num_threads {
         PAR_THREAD_POOL.with(|pool| {
@@ -505,6 +508,7 @@ pub fn process_blockstore(
         opts.shrink_ratio,
         false,
         opts.accounts_db_config.clone(),
+        accounts_update_notifier,
     );
     let bank0 = Arc::new(bank0);
     info!("processing ledger for slot 0...");
@@ -599,8 +603,8 @@ fn do_process_blockstore_from_root(
         blockstore
             .set_roots(std::iter::once(&start_slot))
             .expect("Couldn't set root slot on startup");
-    } else if !blockstore.is_root(start_slot) {
-        panic!("starting slot isn't root and can't update due to being secondary blockstore access: {}", start_slot);
+    } else {
+        assert!(blockstore.is_root(start_slot), "starting slot isn't root and can't update due to being secondary blockstore access: {}", start_slot);
     }
 
     if let Ok(metas) = blockstore.slot_meta_iterator(start_slot) {
@@ -1192,8 +1196,16 @@ fn load_frozen_forks(
                         block_height,
                         snapshot_config.full_snapshot_archive_interval_slots,
                     ) {
+                        info!("Taking snapshot of new root bank that has crossed the full snapshot interval! slot: {}", *root);
                         *last_full_snapshot_slot = Some(*root);
-                        new_root_bank.clean_accounts(true, true, *last_full_snapshot_slot);
+                        new_root_bank.exhaustively_free_unused_resource(*last_full_snapshot_slot);
+                        last_free = Instant::now();
+                        new_root_bank.update_accounts_hash_with_index_option(
+                            snapshot_config.accounts_hash_use_index,
+                            snapshot_config.accounts_hash_debug_verify,
+                            Some(new_root_bank.epoch_schedule().slots_per_epoch),
+                            false,
+                        );
                         snapshot_utils::snapshot_bank(
                             new_root_bank,
                             new_root_bank.src.slot_deltas(&new_root_bank.src.roots()),
@@ -1330,8 +1342,8 @@ fn process_single_slot(
             blockstore
                 .set_dead_slot(slot)
                 .expect("Failed to mark slot as dead in blockstore");
-        } else if !blockstore.is_dead(slot) {
-            panic!("Failed slot isn't dead and can't update due to being secondary blockstore access: {}", slot);
+        } else {
+            assert!(blockstore.is_dead(slot), "Failed slot isn't dead and can't update due to being secondary blockstore access: {}", slot);
         }
         err
     })?;
@@ -1467,9 +1479,8 @@ pub mod tests {
     use matches::assert_matches;
     use rand::{thread_rng, Rng};
     use solana_entry::entry::{create_ticks, next_entry, next_entry_mut};
-    use solana_runtime::{
-        genesis_utils::{self, create_genesis_config_with_vote_accounts, ValidatorVoteKeypairs},
-        snapshot_utils::{ArchiveFormat, SnapshotVersion},
+    use solana_runtime::genesis_utils::{
+        self, create_genesis_config_with_vote_accounts, ValidatorVoteKeypairs,
     };
     use solana_sdk::{
         account::{AccountSharedData, WritableAccount},
@@ -1507,6 +1518,7 @@ pub mod tests {
             None,
             None,
             accounts_package_sender,
+            None,
         )
         .unwrap()
     }
@@ -1522,9 +1534,8 @@ pub mod tests {
         genesis_config.poh_config.hashes_per_tick = Some(hashes_per_tick);
         let ticks_per_slot = genesis_config.ticks_per_slot;
 
-        let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
-        let blockstore =
-            Blockstore::open(&ledger_path).expect("Expected to successfully open database ledger");
+        let (ledger_path, blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
         let parent_slot = 0;
         let slot = 1;
@@ -1563,8 +1574,8 @@ pub mod tests {
         let ticks_per_slot = genesis_config.ticks_per_slot;
 
         // Create a new ledger with slot 0 full of ticks
-        let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let (ledger_path, blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
         // Write slot 1 with one tick missing
         let parent_slot = 0;
@@ -1626,8 +1637,8 @@ pub mod tests {
         } = create_genesis_config(10_000);
         let ticks_per_slot = genesis_config.ticks_per_slot;
 
-        let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let (ledger_path, blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
         let mut entries = create_ticks(ticks_per_slot, 0, blockhash);
         let trailing_entry = {
@@ -1685,11 +1696,10 @@ pub mod tests {
         */
 
         // Create a new ledger with slot 0 full of ticks
-        let (ledger_path, mut blockhash) = create_new_tmp_ledger!(&genesis_config);
+        let (ledger_path, mut blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
         debug!("ledger_path: {:?}", ledger_path);
 
-        let blockstore =
-            Blockstore::open(&ledger_path).expect("Expected to successfully open database ledger");
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
         // Write slot 1
         // slot 1, points at slot 0.  Missing one tick
@@ -1759,7 +1769,7 @@ pub mod tests {
         let ticks_per_slot = genesis_config.ticks_per_slot;
 
         // Create a new ledger with slot 0 full of ticks
-        let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
+        let (ledger_path, blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
         debug!("ledger_path: {:?}", ledger_path);
         let mut last_entry_hash = blockhash;
 
@@ -1777,8 +1787,7 @@ pub mod tests {
                    slot 4 <-- set_root(true)
 
         */
-        let blockstore =
-            Blockstore::open(&ledger_path).expect("Expected to successfully open database ledger");
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
         // Fork 1, ending at slot 3
         let last_slot1_entry_hash =
@@ -1838,7 +1847,7 @@ pub mod tests {
         let ticks_per_slot = genesis_config.ticks_per_slot;
 
         // Create a new ledger with slot 0 full of ticks
-        let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
+        let (ledger_path, blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
         debug!("ledger_path: {:?}", ledger_path);
         let mut last_entry_hash = blockhash;
 
@@ -1856,8 +1865,7 @@ pub mod tests {
                    slot 4
 
         */
-        let blockstore =
-            Blockstore::open(&ledger_path).expect("Expected to successfully open database ledger");
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
         // Fork 1, ending at slot 3
         let last_slot1_entry_hash =
@@ -1926,7 +1934,7 @@ pub mod tests {
 
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
         let ticks_per_slot = genesis_config.ticks_per_slot;
-        let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
+        let (ledger_path, blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
         debug!("ledger_path: {:?}", ledger_path);
 
         /*
@@ -1939,7 +1947,7 @@ pub mod tests {
                            \
                         slot 3
         */
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let slot1_blockhash =
             fill_blockstore_slot_with_ticks(&blockstore, ticks_per_slot, 1, 0, blockhash);
         fill_blockstore_slot_with_ticks(&blockstore, ticks_per_slot, 2, 1, slot1_blockhash);
@@ -1968,7 +1976,7 @@ pub mod tests {
 
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
         let ticks_per_slot = genesis_config.ticks_per_slot;
-        let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
+        let (ledger_path, blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
         debug!("ledger_path: {:?}", ledger_path);
 
         /*
@@ -1981,7 +1989,7 @@ pub mod tests {
                /           \
            slot 4 (dead)   slot 3
         */
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let slot1_blockhash =
             fill_blockstore_slot_with_ticks(&blockstore, ticks_per_slot, 1, 0, blockhash);
         let slot2_blockhash =
@@ -2023,7 +2031,7 @@ pub mod tests {
 
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
         let ticks_per_slot = genesis_config.ticks_per_slot;
-        let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
+        let (ledger_path, blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
         debug!("ledger_path: {:?}", ledger_path);
 
         /*
@@ -2032,7 +2040,7 @@ pub mod tests {
                 /          \
            slot 1 (dead)  slot 2 (dead)
         */
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         fill_blockstore_slot_with_ticks(&blockstore, ticks_per_slot, 1, 0, blockhash);
         fill_blockstore_slot_with_ticks(&blockstore, ticks_per_slot, 2, 0, blockhash);
         blockstore.set_dead_slot(1).unwrap();
@@ -2053,11 +2061,10 @@ pub mod tests {
         let ticks_per_slot = genesis_config.ticks_per_slot;
 
         // Create a new ledger with slot 0 full of ticks
-        let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
+        let (ledger_path, blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
         let mut last_entry_hash = blockhash;
 
-        let blockstore =
-            Blockstore::open(&ledger_path).expect("Expected to successfully open database ledger");
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
         // Let `last_slot` be the number of slots in the first two epochs
         let epoch_schedule = get_epoch_schedule(&genesis_config, Vec::new());
@@ -2178,7 +2185,8 @@ pub mod tests {
             ..
         } = create_genesis_config_with_leader(mint, &leader_pubkey, 50);
         genesis_config.poh_config.hashes_per_tick = Some(hashes_per_tick);
-        let (ledger_path, mut last_entry_hash) = create_new_tmp_ledger!(&genesis_config);
+        let (ledger_path, mut last_entry_hash) =
+            create_new_tmp_ledger_auto_delete!(&genesis_config);
         debug!("ledger_path: {:?}", ledger_path);
 
         let deducted_from_mint = 3;
@@ -2212,8 +2220,7 @@ pub mod tests {
         ));
         let last_blockhash = entries.last().unwrap().hash;
 
-        let blockstore =
-            Blockstore::open(&ledger_path).expect("Expected to successfully open database ledger");
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         blockstore
             .write_entries(
                 1,
@@ -2253,9 +2260,9 @@ pub mod tests {
             mut genesis_config, ..
         } = create_genesis_config(123);
         genesis_config.ticks_per_slot = 1;
-        let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
+        let (ledger_path, _blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
 
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let opts = ProcessOptions {
             poh_verify: true,
             accounts_db_test_hash_calculation: true,
@@ -2271,9 +2278,9 @@ pub mod tests {
     #[test]
     fn test_process_ledger_options_override_threads() {
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(123);
-        let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
+        let (ledger_path, _blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
 
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let opts = ProcessOptions {
             override_num_threads: Some(1),
             accounts_db_test_hash_calculation: true,
@@ -2288,9 +2295,9 @@ pub mod tests {
     #[test]
     fn test_process_ledger_options_full_leader_cache() {
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(123);
-        let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
+        let (ledger_path, _blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
 
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let opts = ProcessOptions {
             full_leader_cache: true,
             accounts_db_test_hash_calculation: true,
@@ -2308,9 +2315,8 @@ pub mod tests {
             mint_keypair,
             ..
         } = create_genesis_config(100);
-        let (ledger_path, last_entry_hash) = create_new_tmp_ledger!(&genesis_config);
-        let blockstore =
-            Blockstore::open(&ledger_path).expect("Expected to successfully open database ledger");
+        let (ledger_path, last_entry_hash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let blockhash = genesis_config.hash();
         let keypairs = [Keypair::new(), Keypair::new(), Keypair::new()];
 
@@ -2988,8 +2994,8 @@ pub mod tests {
 
         // Create roots at slots 0, 1
         let forks = tr(0) / tr(1);
-        let ledger_path = get_tmp_ledger_path!();
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         blockstore.add_tree(
             forks,
             false,
@@ -3021,8 +3027,8 @@ pub mod tests {
 
         let ticks_per_slot = 1;
         genesis_config.ticks_per_slot = ticks_per_slot;
-        let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let (ledger_path, blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
         /*
           Build a blockstore in the ledger with the following fork structure:
@@ -3123,8 +3129,8 @@ pub mod tests {
 
         let ticks_per_slot = 1;
         genesis_config.ticks_per_slot = ticks_per_slot;
-        let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let (ledger_path, blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
         const ROOT_INTERVAL_SLOTS: Slot = 2;
         const FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS: Slot = ROOT_INTERVAL_SLOTS * 5;
@@ -3173,13 +3179,8 @@ pub mod tests {
         let bank_snapshots_tempdir = TempDir::new().unwrap();
         let snapshot_config = SnapshotConfig {
             full_snapshot_archive_interval_slots: FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
-            incremental_snapshot_archive_interval_slots: Slot::MAX, // value does not matter
-            snapshot_archives_dir: PathBuf::default(),              // value does not matter
             bank_snapshots_dir: bank_snapshots_tempdir.path().to_path_buf(),
-            archive_format: ArchiveFormat::TarZstd, // value does not matter
-            snapshot_version: SnapshotVersion::default(), // value does not matter
-            maximum_full_snapshot_archives_to_retain: usize::MAX, // value does not matter
-            maximum_incremental_snapshot_archives_to_retain: usize::MAX, // value does not matter
+            ..SnapshotConfig::default()
         };
 
         let (accounts_package_sender, accounts_package_receiver) = channel();
@@ -3615,8 +3616,8 @@ pub mod tests {
                 vec![100],
             );
         let ticks_per_slot = genesis_config.ticks_per_slot();
-        let ledger_path = get_tmp_ledger_path!();
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         blockstore.add_tree(forks, false, true, ticks_per_slot, genesis_config.hash());
 
         if let Some(blockstore_root) = blockstore_root {

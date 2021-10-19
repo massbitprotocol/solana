@@ -19,10 +19,10 @@ use {
         consensus::{Tower, SWITCH_FORK_THRESHOLD, VOTE_THRESHOLD_DEPTH},
         optimistic_confirmation_verifier::OptimisticConfirmationVerifier,
         replay_stage::DUPLICATE_THRESHOLD,
-        tower_storage::FileTowerStorage,
+        tower_storage::{FileTowerStorage, SavedTower, TowerStorage},
         validator::ValidatorConfig,
     },
-    solana_download_utils::download_snapshot,
+    solana_download_utils::download_snapshot_archive,
     solana_gossip::{
         cluster_info::VALIDATOR_PORT_RANGE,
         crds::Cursor,
@@ -44,6 +44,7 @@ use {
     solana_runtime::{
         snapshot_archive_info::SnapshotArchiveInfoGetter,
         snapshot_config::SnapshotConfig,
+        snapshot_package::SnapshotType,
         snapshot_utils::{self, ArchiveFormat},
     },
     solana_sdk::{
@@ -1477,9 +1478,7 @@ fn generate_frozen_account_panic(mut cluster: LocalCluster, frozen_account: Arc<
 
         sleep(Duration::from_secs(1));
         i += 1;
-        if i > 10 {
-            panic!("FROZEN_ACCOUNT_PANIC still false");
-        }
+        assert!(i <= 10, "FROZEN_ACCOUNT_PANIC still false");
     }
 
     // The validator is now broken and won't shutdown properly.  Avoid LocalCluster panic in Drop
@@ -1543,10 +1542,12 @@ fn test_frozen_account_from_snapshot() {
         .snapshot_archives_dir;
 
     trace!("Waiting for snapshot at {:?}", snapshot_archives_dir);
-    let (archive_filename, _archive_snapshot_hash) =
-        wait_for_next_snapshot(&cluster, snapshot_archives_dir);
+    let full_snapshot_archive_info = cluster.wait_for_next_full_snapshot(snapshot_archives_dir);
 
-    trace!("Found snapshot: {:?}", archive_filename);
+    trace!(
+        "Found snapshot: {}",
+        full_snapshot_archive_info.path().display()
+    );
 
     // Restart the validator from a snapshot
     let validator_info = cluster.exit_node(&validator_identity.pubkey());
@@ -1688,7 +1689,6 @@ fn test_snapshot_download() {
 
     let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
 
-    // Get slot after which this was generated
     let snapshot_archives_dir = &leader_snapshot_test_config
         .validator_config
         .snapshot_config
@@ -1697,18 +1697,31 @@ fn test_snapshot_download() {
         .snapshot_archives_dir;
 
     trace!("Waiting for snapshot");
-    let (archive_filename, archive_snapshot_hash) =
-        wait_for_next_snapshot(&cluster, snapshot_archives_dir);
-    trace!("found: {:?}", archive_filename);
+    let full_snapshot_archive_info = cluster.wait_for_next_full_snapshot(snapshot_archives_dir);
+    trace!("found: {}", full_snapshot_archive_info.path().display());
 
     // Download the snapshot, then boot a validator from it.
-    download_snapshot(
+    download_snapshot_archive(
         &cluster.entry_point_info.rpc,
-        validator_snapshot_test_config.snapshot_archives_dir.path(),
-        archive_snapshot_hash,
+        snapshot_archives_dir,
+        (
+            full_snapshot_archive_info.slot(),
+            *full_snapshot_archive_info.hash(),
+        ),
+        SnapshotType::FullSnapshot,
+        validator_snapshot_test_config
+            .validator_config
+            .snapshot_config
+            .as_ref()
+            .unwrap()
+            .maximum_full_snapshot_archives_to_retain,
+        validator_snapshot_test_config
+            .validator_config
+            .snapshot_config
+            .as_ref()
+            .unwrap()
+            .maximum_incremental_snapshot_archives_to_retain,
         false,
-        snapshot_utils::DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN,
-        snapshot_utils::DEFAULT_MAX_INCREMENTAL_SNAPSHOT_ARCHIVES_TO_RETAIN,
         &mut None,
     )
     .unwrap();
@@ -1720,6 +1733,551 @@ fn test_snapshot_download() {
         None,
         SocketAddrSpace::Unspecified,
     );
+}
+
+#[test]
+#[serial]
+fn test_incremental_snapshot_download() {
+    solana_logger::setup_with_default(RUST_LOG_FILTER);
+    // First set up the cluster with 1 node
+    let accounts_hash_interval = 3;
+    let incremental_snapshot_interval = accounts_hash_interval * 3;
+    let full_snapshot_interval = incremental_snapshot_interval * 3;
+    let num_account_paths = 3;
+
+    let leader_snapshot_test_config = SnapshotValidatorConfig::new(
+        full_snapshot_interval,
+        incremental_snapshot_interval,
+        accounts_hash_interval,
+        num_account_paths,
+    );
+    let validator_snapshot_test_config = SnapshotValidatorConfig::new(
+        full_snapshot_interval,
+        incremental_snapshot_interval,
+        accounts_hash_interval,
+        num_account_paths,
+    );
+
+    let stake = 10_000;
+    let mut config = ClusterConfig {
+        node_stakes: vec![stake],
+        cluster_lamports: 1_000_000,
+        validator_configs: make_identical_validator_configs(
+            &leader_snapshot_test_config.validator_config,
+            1,
+        ),
+        ..ClusterConfig::default()
+    };
+
+    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+
+    let snapshot_archives_dir = &leader_snapshot_test_config
+        .validator_config
+        .snapshot_config
+        .as_ref()
+        .unwrap()
+        .snapshot_archives_dir;
+
+    debug!("snapshot config:\n\tfull snapshot interval: {}\n\tincremental snapshot interval: {}\n\taccounts hash interval: {}",
+           full_snapshot_interval,
+           incremental_snapshot_interval,
+           accounts_hash_interval);
+    debug!(
+        "leader config:\n\tbank snapshots dir: {}\n\tsnapshot archives dir: {}",
+        leader_snapshot_test_config
+            .bank_snapshots_dir
+            .path()
+            .display(),
+        leader_snapshot_test_config
+            .snapshot_archives_dir
+            .path()
+            .display(),
+    );
+    debug!(
+        "validator config:\n\tbank snapshots dir: {}\n\tsnapshot archives dir: {}",
+        validator_snapshot_test_config
+            .bank_snapshots_dir
+            .path()
+            .display(),
+        validator_snapshot_test_config
+            .snapshot_archives_dir
+            .path()
+            .display(),
+    );
+
+    trace!("Waiting for snapshots");
+    let (incremental_snapshot_archive_info, full_snapshot_archive_info) =
+        cluster.wait_for_next_incremental_snapshot(snapshot_archives_dir);
+    trace!(
+        "found: {} and {}",
+        full_snapshot_archive_info.path().display(),
+        incremental_snapshot_archive_info.path().display()
+    );
+
+    // Download the snapshots, then boot a validator from them.
+    download_snapshot_archive(
+        &cluster.entry_point_info.rpc,
+        snapshot_archives_dir,
+        (
+            full_snapshot_archive_info.slot(),
+            *full_snapshot_archive_info.hash(),
+        ),
+        SnapshotType::FullSnapshot,
+        validator_snapshot_test_config
+            .validator_config
+            .snapshot_config
+            .as_ref()
+            .unwrap()
+            .maximum_full_snapshot_archives_to_retain,
+        validator_snapshot_test_config
+            .validator_config
+            .snapshot_config
+            .as_ref()
+            .unwrap()
+            .maximum_incremental_snapshot_archives_to_retain,
+        false,
+        &mut None,
+    )
+    .unwrap();
+
+    download_snapshot_archive(
+        &cluster.entry_point_info.rpc,
+        snapshot_archives_dir,
+        (
+            incremental_snapshot_archive_info.slot(),
+            *incremental_snapshot_archive_info.hash(),
+        ),
+        SnapshotType::IncrementalSnapshot(incremental_snapshot_archive_info.base_slot()),
+        validator_snapshot_test_config
+            .validator_config
+            .snapshot_config
+            .as_ref()
+            .unwrap()
+            .maximum_full_snapshot_archives_to_retain,
+        validator_snapshot_test_config
+            .validator_config
+            .snapshot_config
+            .as_ref()
+            .unwrap()
+            .maximum_incremental_snapshot_archives_to_retain,
+        false,
+        &mut None,
+    )
+    .unwrap();
+
+    cluster.add_validator(
+        &validator_snapshot_test_config.validator_config,
+        stake,
+        Arc::new(Keypair::new()),
+        None,
+        SocketAddrSpace::Unspecified,
+    );
+}
+
+/// Test the scenario where a node starts up from a snapshot and its blockstore has enough new
+/// roots that cross the full snapshot interval.  In this scenario, the node needs to take a full
+/// snapshot while processing the blockstore so that once the background services start up, there
+/// is the correct full snapshot available to take subsequent incremental snapshots.
+///
+/// For this test...
+/// - Start a leader node and run it long enough to take a full and incremental snapshot
+/// - Download those snapshots to a validator node
+/// - Copy the validator snapshots to a back up directory
+/// - Start up the validator node
+/// - Wait for the validator node to see enough root slots to cross the full snapshot interval
+/// - Delete the snapshots on the validator node and restore the ones from the backup
+/// - Restart the validator node to trigger the scenario we're trying to test
+/// - Wait for the validator node to generate a new incremental snapshot
+/// - Copy the new incremental snapshot (and its associated full snapshot) to another new validator
+/// - Start up this new validator to ensure the snapshots from ^^^ are good
+#[test]
+#[serial]
+fn test_incremental_snapshot_download_with_crossing_full_snapshot_interval_at_startup() {
+    solana_logger::setup_with_default(RUST_LOG_FILTER);
+    // If these intervals change, also make sure to change the loop timers accordingly.
+    let accounts_hash_interval = 3;
+    let incremental_snapshot_interval = accounts_hash_interval * 3;
+    let full_snapshot_interval = incremental_snapshot_interval * 3;
+
+    let num_account_paths = 3;
+    let leader_snapshot_test_config = SnapshotValidatorConfig::new(
+        full_snapshot_interval,
+        incremental_snapshot_interval,
+        accounts_hash_interval,
+        num_account_paths,
+    );
+    let validator_snapshot_test_config = SnapshotValidatorConfig::new(
+        full_snapshot_interval,
+        incremental_snapshot_interval,
+        accounts_hash_interval,
+        num_account_paths,
+    );
+    let stake = 10_000;
+    let mut config = ClusterConfig {
+        node_stakes: vec![stake],
+        cluster_lamports: 1_000_000,
+        validator_configs: make_identical_validator_configs(
+            &leader_snapshot_test_config.validator_config,
+            1,
+        ),
+        ..ClusterConfig::default()
+    };
+
+    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+
+    debug!("snapshot config:\n\tfull snapshot interval: {}\n\tincremental snapshot interval: {}\n\taccounts hash interval: {}",
+           full_snapshot_interval,
+           incremental_snapshot_interval,
+           accounts_hash_interval);
+    debug!(
+        "leader config:\n\tbank snapshots dir: {}\n\tsnapshot archives dir: {}",
+        leader_snapshot_test_config
+            .bank_snapshots_dir
+            .path()
+            .display(),
+        leader_snapshot_test_config
+            .snapshot_archives_dir
+            .path()
+            .display(),
+    );
+    debug!(
+        "validator config:\n\tbank snapshots dir: {}\n\tsnapshot archives dir: {}",
+        validator_snapshot_test_config
+            .bank_snapshots_dir
+            .path()
+            .display(),
+        validator_snapshot_test_config
+            .snapshot_archives_dir
+            .path()
+            .display(),
+    );
+
+    info!("Waiting for leader to create snapshots...");
+    let (incremental_snapshot_archive_info, full_snapshot_archive_info) =
+        LocalCluster::wait_for_next_incremental_snapshot(
+            &cluster,
+            leader_snapshot_test_config.snapshot_archives_dir.path(),
+        );
+    debug!(
+        "Found snapshots:\n\tfull snapshot: {}\n\tincremental snapshot: {}",
+        full_snapshot_archive_info.path().display(),
+        incremental_snapshot_archive_info.path().display()
+    );
+    assert_eq!(
+        full_snapshot_archive_info.slot(),
+        incremental_snapshot_archive_info.base_slot()
+    );
+
+    // Download the snapshots, then boot a validator from them.
+    info!("Downloading full snapshot to validator...");
+    download_snapshot_archive(
+        &cluster.entry_point_info.rpc,
+        validator_snapshot_test_config.snapshot_archives_dir.path(),
+        (
+            full_snapshot_archive_info.slot(),
+            *full_snapshot_archive_info.hash(),
+        ),
+        SnapshotType::FullSnapshot,
+        validator_snapshot_test_config
+            .validator_config
+            .snapshot_config
+            .as_ref()
+            .unwrap()
+            .maximum_full_snapshot_archives_to_retain,
+        validator_snapshot_test_config
+            .validator_config
+            .snapshot_config
+            .as_ref()
+            .unwrap()
+            .maximum_incremental_snapshot_archives_to_retain,
+        false,
+        &mut None,
+    )
+    .unwrap();
+    let downloaded_full_snapshot_archive_info =
+        snapshot_utils::get_highest_full_snapshot_archive_info(
+            validator_snapshot_test_config.snapshot_archives_dir.path(),
+        )
+        .unwrap();
+    debug!(
+        "Downloaded full snapshot, slot: {}",
+        downloaded_full_snapshot_archive_info.slot()
+    );
+
+    info!("Downloading incremental snapshot to validator...");
+    download_snapshot_archive(
+        &cluster.entry_point_info.rpc,
+        validator_snapshot_test_config.snapshot_archives_dir.path(),
+        (
+            incremental_snapshot_archive_info.slot(),
+            *incremental_snapshot_archive_info.hash(),
+        ),
+        SnapshotType::IncrementalSnapshot(incremental_snapshot_archive_info.base_slot()),
+        validator_snapshot_test_config
+            .validator_config
+            .snapshot_config
+            .as_ref()
+            .unwrap()
+            .maximum_full_snapshot_archives_to_retain,
+        validator_snapshot_test_config
+            .validator_config
+            .snapshot_config
+            .as_ref()
+            .unwrap()
+            .maximum_incremental_snapshot_archives_to_retain,
+        false,
+        &mut None,
+    )
+    .unwrap();
+    let downloaded_incremental_snapshot_archive_info =
+        snapshot_utils::get_highest_incremental_snapshot_archive_info(
+            validator_snapshot_test_config.snapshot_archives_dir.path(),
+            full_snapshot_archive_info.slot(),
+        )
+        .unwrap();
+    debug!(
+        "Downloaded incremental snapshot, slot: {}, base slot: {}",
+        downloaded_incremental_snapshot_archive_info.slot(),
+        downloaded_incremental_snapshot_archive_info.base_slot(),
+    );
+    assert_eq!(
+        downloaded_full_snapshot_archive_info.slot(),
+        downloaded_incremental_snapshot_archive_info.base_slot()
+    );
+
+    // closure to copy files in a directory to another directory
+    let copy_files = |from: &Path, to: &Path| {
+        trace!(
+            "copying files from dir {}, to dir {}",
+            from.display(),
+            to.display()
+        );
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                continue;
+            }
+            let from_file_path = entry.path();
+            let to_file_path = to.join(from_file_path.file_name().unwrap());
+            trace!(
+                "\t\tcopying file from {} to {}...",
+                from_file_path.display(),
+                to_file_path.display()
+            );
+            fs::copy(from_file_path, to_file_path).unwrap();
+        }
+    };
+    // closure to delete files in a directory
+    let delete_files = |dir: &Path| {
+        trace!("deleting files in dir {}", dir.display());
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                continue;
+            }
+            let file_path = entry.path();
+            trace!("\t\tdeleting file {}...", file_path.display());
+            fs::remove_file(file_path).unwrap();
+        }
+    };
+
+    // After downloading the snapshots, copy them over to a backup directory.  Later we'll need to
+    // restart the node and guarantee that the only snapshots present are these initial ones.  So,
+    // the easiest way to do that is create a backup now, delete the ones on the node before
+    // restart, then copy the backup ones over again.
+    let backup_validator_snapshot_archives_dir = tempfile::tempdir_in(farf_dir()).unwrap();
+    trace!(
+        "Backing up validator snapshots to dir: {}...",
+        backup_validator_snapshot_archives_dir.path().display()
+    );
+    copy_files(
+        validator_snapshot_test_config.snapshot_archives_dir.path(),
+        backup_validator_snapshot_archives_dir.path(),
+    );
+
+    info!("Starting a new validator...");
+    let validator_identity = Arc::new(Keypair::new());
+    cluster.add_validator(
+        &validator_snapshot_test_config.validator_config,
+        stake,
+        validator_identity.clone(),
+        None,
+        SocketAddrSpace::Unspecified,
+    );
+
+    // To ensure that a snapshot will be taken during startup, the blockstore needs to have roots
+    // that cross a full snapshot interval.
+    info!("Waiting for the validator to see enough slots to cross a full snapshot interval...");
+    let starting_slot = incremental_snapshot_archive_info.slot();
+    let timer = Instant::now();
+    loop {
+        let validator_current_slot = cluster
+            .get_validator_client(&validator_identity.pubkey())
+            .unwrap()
+            .get_slot_with_commitment(CommitmentConfig::finalized())
+            .unwrap();
+        if validator_current_slot > (starting_slot + full_snapshot_interval) {
+            break;
+        }
+        assert!(
+            timer.elapsed() < Duration::from_secs(30),
+            "It should not take longer than 30 seconds to cross the next full snapshot interval."
+        );
+        std::thread::yield_now();
+    }
+    trace!("Waited {:?}", timer.elapsed());
+
+    // Get the highest full snapshot archive info for the validator, now that it has crossed the
+    // next full snapshot interval.  We are going to use this to look up the same snapshot on the
+    // leader, which we'll then use to compare to the full snapshot the validator will create
+    // during startup.  This ensures the snapshot creation process during startup is correct.
+    //
+    // Putting this all in its own block so its clear we're only intended to keep the leader's info
+    let leader_full_snapshot_archive_info_for_comparison = {
+        let validator_full_snapshot = snapshot_utils::get_highest_full_snapshot_archive_info(
+            validator_snapshot_test_config.snapshot_archives_dir.path(),
+        )
+        .unwrap();
+
+        // Now get the same full snapshot on the LEADER that we just got from the validator
+        let mut leader_full_snapshots = snapshot_utils::get_full_snapshot_archives(
+            leader_snapshot_test_config.snapshot_archives_dir.path(),
+        );
+        leader_full_snapshots.retain(|full_snapshot| {
+            full_snapshot.slot() == validator_full_snapshot.slot()
+                && full_snapshot.hash() == validator_full_snapshot.hash()
+        });
+
+        // NOTE: If this unwrap() ever fails, it may be that the leader's old full snapshot archives
+        // were purged.  If that happens, increase the maximum_full_snapshot_archives_to_retain
+        // in the leader's Snapshotconfig.
+        let leader_full_snapshot = leader_full_snapshots.first().unwrap();
+
+        // And for sanity, the full snapshot from the leader and the validator MUST be the same
+        assert_eq!(
+            (
+                validator_full_snapshot.slot(),
+                validator_full_snapshot.hash()
+            ),
+            (leader_full_snapshot.slot(), leader_full_snapshot.hash())
+        );
+
+        leader_full_snapshot.clone()
+    };
+
+    trace!(
+        "Delete all the snapshots on the validator and restore the originals from the backup..."
+    );
+    delete_files(validator_snapshot_test_config.snapshot_archives_dir.path());
+    copy_files(
+        backup_validator_snapshot_archives_dir.path(),
+        validator_snapshot_test_config.snapshot_archives_dir.path(),
+    );
+
+    // Get the highest full snapshot slot *before* restarting, as a comparison
+    let validator_full_snapshot_slot_at_startup =
+        snapshot_utils::get_highest_full_snapshot_archive_slot(
+            validator_snapshot_test_config.snapshot_archives_dir.path(),
+        )
+        .unwrap();
+
+    info!("Restarting the validator...");
+    let validator_info = cluster.exit_node(&validator_identity.pubkey());
+    cluster.restart_node(
+        &validator_identity.pubkey(),
+        validator_info,
+        SocketAddrSpace::Unspecified,
+    );
+
+    // Now, we want to ensure that the validator can make a new incremental snapshot based on the
+    // new full snapshot that was created during the restart.
+    let timer = Instant::now();
+    let (
+        validator_highest_full_snapshot_archive_info,
+        _validator_highest_incremental_snapshot_archive_info,
+    ) = loop {
+        if let Some(highest_full_snapshot_info) =
+            snapshot_utils::get_highest_full_snapshot_archive_info(
+                validator_snapshot_test_config.snapshot_archives_dir.path(),
+            )
+        {
+            if highest_full_snapshot_info.slot() > validator_full_snapshot_slot_at_startup {
+                if let Some(highest_incremental_snapshot_info) =
+                    snapshot_utils::get_highest_incremental_snapshot_archive_info(
+                        validator_snapshot_test_config.snapshot_archives_dir.path(),
+                        highest_full_snapshot_info.slot(),
+                    )
+                {
+                    info!("Success! Made new full and incremental snapshots!");
+                    trace!(
+                        "Full snapshot slot: {}, incremental snapshot slot: {}",
+                        highest_full_snapshot_info.slot(),
+                        highest_incremental_snapshot_info.slot(),
+                    );
+                    break (
+                        highest_full_snapshot_info,
+                        highest_incremental_snapshot_info,
+                    );
+                }
+            }
+        }
+        assert!(
+            timer.elapsed() < Duration::from_secs(10),
+            "It should not take longer than 10 seconds to cross the next incremental snapshot interval."
+        );
+        std::thread::yield_now();
+    };
+    trace!("Waited {:?}", timer.elapsed());
+
+    // Check to make sure that the full snapshot the validator created during startup is the same
+    // as the snapshot the leader created.
+    // NOTE: If the assert fires and the _slots_ don't match (specifically are off by a full
+    // snapshot interval), then that means the loop to get the
+    // `validator_highest_full_snapshot_archive_info` saw the wrong one, and that may've been due
+    // to some weird scheduling/delays on the machine running the test.  Run the test again.  If
+    // this ever fails repeatedly then the test will need to be modified to handle this case.
+    assert_eq!(
+        (
+            validator_highest_full_snapshot_archive_info.slot(),
+            validator_highest_full_snapshot_archive_info.hash()
+        ),
+        (
+            leader_full_snapshot_archive_info_for_comparison.slot(),
+            leader_full_snapshot_archive_info_for_comparison.hash()
+        )
+    );
+
+    // And lastly, startup another node with the new snapshots to ensure they work
+    let final_validator_snapshot_test_config = SnapshotValidatorConfig::new(
+        full_snapshot_interval,
+        incremental_snapshot_interval,
+        accounts_hash_interval,
+        num_account_paths,
+    );
+
+    // Copy over the snapshots to the new node, but need to remove the tmp snapshot dir so it
+    // doesn't break the simple copy_files closure.
+    snapshot_utils::remove_tmp_snapshot_archives(
+        validator_snapshot_test_config.snapshot_archives_dir.path(),
+    );
+    copy_files(
+        validator_snapshot_test_config.snapshot_archives_dir.path(),
+        final_validator_snapshot_test_config
+            .snapshot_archives_dir
+            .path(),
+    );
+
+    info!("Starting final validator...");
+    let final_validator_identity = Arc::new(Keypair::new());
+    cluster.add_validator(
+        &final_validator_snapshot_test_config.validator_config,
+        stake,
+        final_validator_identity,
+        None,
+        SocketAddrSpace::Unspecified,
+    );
+
+    // Success!
 }
 
 #[allow(unused_attributes)]
@@ -1765,8 +2323,7 @@ fn test_snapshot_restart_tower() {
         .unwrap()
         .snapshot_archives_dir;
 
-    let (archive_filename, archive_snapshot_hash) =
-        wait_for_next_snapshot(&cluster, snapshot_archives_dir);
+    let full_snapshot_archive_info = cluster.wait_for_next_full_snapshot(snapshot_archives_dir);
 
     // Copy archive to validator's snapshot output directory
     let validator_archive_path = snapshot_utils::build_full_snapshot_archive_path(
@@ -1774,11 +2331,11 @@ fn test_snapshot_restart_tower() {
             .snapshot_archives_dir
             .path()
             .to_path_buf(),
-        archive_snapshot_hash.0,
-        &archive_snapshot_hash.1,
-        ArchiveFormat::TarBzip2,
+        full_snapshot_archive_info.slot(),
+        full_snapshot_archive_info.hash(),
+        full_snapshot_archive_info.archive_format(),
     );
-    fs::hard_link(archive_filename, &validator_archive_path).unwrap();
+    fs::hard_link(full_snapshot_archive_info.path(), &validator_archive_path).unwrap();
 
     // Restart validator from snapshot, the validator's tower state in this snapshot
     // will contain slots < the root bank of the snapshot. Validator should not panic.
@@ -1958,7 +2515,7 @@ fn test_snapshots_restart_validity() {
 
         expected_balances.extend(new_balances);
 
-        wait_for_next_snapshot(&cluster, snapshot_archives_dir);
+        cluster.wait_for_next_full_snapshot(snapshot_archives_dir);
 
         // Create new account paths since validator exit is not guaranteed to cleanup RPC threads,
         // which may delete the old accounts on exit at any point
@@ -2027,7 +2584,6 @@ fn test_fake_shreds_broadcast_leader() {
 
 #[test]
 #[serial]
-#[ignore]
 #[allow(unused_attributes)]
 fn test_duplicate_shreds_broadcast_leader() {
     // Create 4 nodes:
@@ -2150,7 +2706,7 @@ fn test_duplicate_shreds_broadcast_leader() {
                     vote.slots.last().unwrap().cmp(vote2.slots.last().unwrap())
                 });
 
-                for (parsed_vote, leader_vote_tx) in parsed_vote_iter {
+                for (parsed_vote, leader_vote_tx) in &parsed_vote_iter {
                     if let Some(latest_vote_slot) = parsed_vote.slots.last() {
                         info!("received vote for {}", latest_vote_slot);
                         // Add to EpochSlots. Mark all slots frozen between slot..=max_vote_slot.
@@ -2202,6 +2758,10 @@ fn test_duplicate_shreds_broadcast_leader() {
                         }
                     }
                     // Give vote some time to propagate
+                    sleep(Duration::from_millis(100));
+                }
+
+                if parsed_vote_iter.is_empty() {
                     sleep(Duration::from_millis(100));
                 }
             }
@@ -2625,6 +3185,12 @@ fn copy_blocks(end_slot: Slot, source: &Blockstore, dest: &Blockstore) {
     }
 }
 
+fn save_tower(tower_path: &Path, tower: &Tower, node_keypair: &Keypair) {
+    let file_tower_storage = FileTowerStorage::new(tower_path.to_path_buf());
+    let saved_tower = SavedTower::new(tower, node_keypair).unwrap();
+    file_tower_storage.store(&saved_tower).unwrap();
+}
+
 fn restore_tower(tower_path: &Path, node_pubkey: &Pubkey) -> Option<Tower> {
     let file_tower_storage = FileTowerStorage::new(tower_path.to_path_buf());
 
@@ -2775,12 +3341,11 @@ fn do_test_optimistic_confirmation_violation_with_or_without_tower(with_tower: b
     let now = Instant::now();
     loop {
         let elapsed = now.elapsed();
-        if elapsed > Duration::from_secs(30) {
-            panic!(
-                "LocalCluster nodes failed to log enough tower votes in {} secs",
-                elapsed.as_secs()
-            );
-        }
+        assert!(
+            elapsed <= Duration::from_secs(30),
+            "LocalCluster nodes failed to log enough tower votes in {} secs",
+            elapsed.as_secs()
+        );
         sleep(Duration::from_millis(100));
 
         if let Some((last_vote, _)) = last_vote_in_tower(&val_b_ledger_path, &validator_b_pubkey) {
@@ -3209,6 +3774,91 @@ fn test_run_test_load_program_accounts_root() {
 
 #[test]
 #[serial]
+fn test_restart_tower_rollback() {
+    // Test node crashing and failing to save its tower before restart
+    solana_logger::setup_with_default(RUST_LOG_FILTER);
+
+    // First set up the cluster with 4 nodes
+    let slots_per_epoch = 2048;
+    let node_stakes = vec![10000, 1];
+
+    let validator_strings = vec![
+        "28bN3xyvrP4E8LwEgtLjhnkb7cY4amQb6DrYAbAYjgRV4GAGgkVM2K7wnxnAS7WDneuavza7x21MiafLu1HkwQt4",
+        "2saHBBoTkLMmttmPQP8KfBkcCw45S5cwtV3wTdGCscRC8uxdgvHxpHiWXKx4LvJjNJtnNcbSv5NdheokFFqnNDt8",
+    ];
+
+    let validator_b_keypair = Arc::new(Keypair::from_base58_string(validator_strings[1]));
+    let validator_b_pubkey = validator_b_keypair.pubkey();
+
+    let validator_keys = validator_strings
+        .iter()
+        .map(|s| (Arc::new(Keypair::from_base58_string(s)), true))
+        .take(node_stakes.len())
+        .collect::<Vec<_>>();
+    let mut config = ClusterConfig {
+        cluster_lamports: 100_000,
+        node_stakes: node_stakes.clone(),
+        validator_configs: make_identical_validator_configs(
+            &ValidatorConfig::default(),
+            node_stakes.len(),
+        ),
+        validator_keys: Some(validator_keys),
+        slots_per_epoch,
+        stakers_slot_offset: slots_per_epoch,
+        skip_warmup_slots: true,
+        ..ClusterConfig::default()
+    };
+    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+
+    let val_b_ledger_path = cluster.ledger_path(&validator_b_pubkey);
+
+    let mut earlier_tower: Tower;
+    loop {
+        sleep(Duration::from_millis(1000));
+
+        // Grab the current saved tower
+        earlier_tower = restore_tower(&val_b_ledger_path, &validator_b_pubkey).unwrap();
+        if earlier_tower.last_voted_slot().unwrap_or(0) > 1 {
+            break;
+        }
+    }
+
+    let exited_validator_info: ClusterValidatorInfo;
+    loop {
+        sleep(Duration::from_millis(1000));
+
+        // Wait for second, lesser staked validator to make a root past the earlier_tower's
+        // latest vote slot, then exit that validator
+        if let Some(root) = root_in_tower(&val_b_ledger_path, &validator_b_pubkey) {
+            if root
+                > earlier_tower
+                    .last_voted_slot()
+                    .expect("Earlier tower must have at least one vote")
+            {
+                exited_validator_info = cluster.exit_node(&validator_b_pubkey);
+                break;
+            }
+        }
+    }
+
+    // Now rewrite the tower with the *earlier_tower*
+    save_tower(&val_b_ledger_path, &earlier_tower, &validator_b_keypair);
+    cluster.restart_node(
+        &validator_b_pubkey,
+        exited_validator_info,
+        SocketAddrSpace::Unspecified,
+    );
+
+    // Check this node is making new roots
+    cluster.check_for_new_roots(
+        20,
+        "test_restart_tower_rollback",
+        SocketAddrSpace::Unspecified,
+    );
+}
+
+#[test]
+#[serial]
 fn test_run_test_load_program_accounts_partition_root() {
     run_test_load_program_accounts_partition(CommitmentConfig::finalized());
 }
@@ -3452,51 +4102,6 @@ fn run_test_load_program_accounts(scan_commitment: CommitmentConfig) {
     t_scan.join().unwrap();
 }
 
-fn wait_for_next_snapshot(
-    cluster: &LocalCluster,
-    snapshot_archives_dir: &Path,
-) -> (PathBuf, (Slot, Hash)) {
-    // Get slot after which this was generated
-    let client = cluster
-        .get_validator_client(&cluster.entry_point_info.id)
-        .unwrap();
-    let last_slot = client
-        .get_slot_with_commitment(CommitmentConfig::processed())
-        .expect("Couldn't get slot");
-
-    // Wait for a snapshot for a bank >= last_slot to be made so we know that the snapshot
-    // must include the transactions just pushed
-    trace!(
-        "Waiting for snapshot archive to be generated with slot > {}",
-        last_slot
-    );
-    loop {
-        if let Some(full_snapshot_archive_info) =
-            snapshot_utils::get_highest_full_snapshot_archive_info(snapshot_archives_dir)
-        {
-            trace!(
-                "full snapshot for slot {} exists",
-                full_snapshot_archive_info.slot()
-            );
-            if full_snapshot_archive_info.slot() >= last_slot {
-                return (
-                    full_snapshot_archive_info.path().clone(),
-                    (
-                        full_snapshot_archive_info.slot(),
-                        *full_snapshot_archive_info.hash(),
-                    ),
-                );
-            }
-            trace!(
-                "full snapshot slot {} < last_slot {}",
-                full_snapshot_archive_info.slot(),
-                last_slot
-            );
-        }
-        sleep(Duration::from_millis(5000));
-    }
-}
-
 fn farf_dir() -> PathBuf {
     std::env::var("FARF_DIR")
         .unwrap_or_else(|_| "farf".to_string())
@@ -3515,47 +4120,73 @@ fn generate_account_paths(num_account_paths: usize) -> (Vec<TempDir>, Vec<PathBu
 }
 
 struct SnapshotValidatorConfig {
-    _snapshot_dir: TempDir,
+    bank_snapshots_dir: TempDir,
     snapshot_archives_dir: TempDir,
     account_storage_dirs: Vec<TempDir>,
     validator_config: ValidatorConfig,
 }
 
+impl SnapshotValidatorConfig {
+    pub fn new(
+        full_snapshot_archive_interval_slots: Slot,
+        incremental_snapshot_archive_interval_slots: Slot,
+        accounts_hash_interval_slots: Slot,
+        num_account_paths: usize,
+    ) -> SnapshotValidatorConfig {
+        assert!(accounts_hash_interval_slots > 0);
+        assert!(full_snapshot_archive_interval_slots > 0);
+        assert!(full_snapshot_archive_interval_slots % accounts_hash_interval_slots == 0);
+        if incremental_snapshot_archive_interval_slots != Slot::MAX {
+            assert!(incremental_snapshot_archive_interval_slots > 0);
+            assert!(
+                incremental_snapshot_archive_interval_slots % accounts_hash_interval_slots == 0
+            );
+            assert!(
+                full_snapshot_archive_interval_slots % incremental_snapshot_archive_interval_slots
+                    == 0
+            );
+        }
+
+        // Create the snapshot config
+        let bank_snapshots_dir = tempfile::tempdir_in(farf_dir()).unwrap();
+        let snapshot_archives_dir = tempfile::tempdir_in(farf_dir()).unwrap();
+        let snapshot_config = SnapshotConfig {
+            full_snapshot_archive_interval_slots,
+            incremental_snapshot_archive_interval_slots,
+            snapshot_archives_dir: snapshot_archives_dir.path().to_path_buf(),
+            bank_snapshots_dir: bank_snapshots_dir.path().to_path_buf(),
+            ..SnapshotConfig::default()
+        };
+
+        // Create the account paths
+        let (account_storage_dirs, account_storage_paths) =
+            generate_account_paths(num_account_paths);
+
+        // Create the validator config
+        let validator_config = ValidatorConfig {
+            snapshot_config: Some(snapshot_config),
+            account_paths: account_storage_paths,
+            accounts_hash_interval_slots,
+            ..ValidatorConfig::default()
+        };
+
+        SnapshotValidatorConfig {
+            bank_snapshots_dir,
+            snapshot_archives_dir,
+            account_storage_dirs,
+            validator_config,
+        }
+    }
+}
+
 fn setup_snapshot_validator_config(
-    snapshot_interval_slots: u64,
+    snapshot_interval_slots: Slot,
     num_account_paths: usize,
 ) -> SnapshotValidatorConfig {
-    // Create the snapshot config
-    let bank_snapshots_dir = tempfile::tempdir_in(farf_dir()).unwrap();
-    let snapshot_archives_dir = tempfile::tempdir_in(farf_dir()).unwrap();
-    let snapshot_config = SnapshotConfig {
-        full_snapshot_archive_interval_slots: snapshot_interval_slots,
-        incremental_snapshot_archive_interval_slots: Slot::MAX,
-        snapshot_archives_dir: snapshot_archives_dir.path().to_path_buf(),
-        bank_snapshots_dir: bank_snapshots_dir.path().to_path_buf(),
-        archive_format: ArchiveFormat::TarBzip2,
-        snapshot_version: snapshot_utils::SnapshotVersion::default(),
-        maximum_full_snapshot_archives_to_retain:
-            snapshot_utils::DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN,
-        maximum_incremental_snapshot_archives_to_retain:
-            snapshot_utils::DEFAULT_MAX_INCREMENTAL_SNAPSHOT_ARCHIVES_TO_RETAIN,
-    };
-
-    // Create the account paths
-    let (account_storage_dirs, account_storage_paths) = generate_account_paths(num_account_paths);
-
-    // Create the validator config
-    let validator_config = ValidatorConfig {
-        snapshot_config: Some(snapshot_config),
-        account_paths: account_storage_paths,
-        accounts_hash_interval_slots: snapshot_interval_slots,
-        ..ValidatorConfig::default()
-    };
-
-    SnapshotValidatorConfig {
-        _snapshot_dir: bank_snapshots_dir,
-        snapshot_archives_dir,
-        account_storage_dirs,
-        validator_config,
-    }
+    SnapshotValidatorConfig::new(
+        snapshot_interval_slots,
+        Slot::MAX,
+        snapshot_interval_slots,
+        num_account_paths,
+    )
 }

@@ -13,15 +13,19 @@ use solana_frozen_abi::abi_example::AbiExample;
 
 fn process_instruction_with_program_logging(
     process_instruction: ProcessInstructionWithContext,
-    program_id: &Pubkey,
+    first_instruction_account: usize,
     instruction_data: &[u8],
     invoke_context: &mut dyn InvokeContext,
 ) -> Result<(), InstructionError> {
+    debug_assert_eq!(first_instruction_account, 1);
+
     let logger = invoke_context.get_logger();
+    let program_id = invoke_context.get_caller()?;
     stable_log::program_invoke(&logger, program_id, invoke_context.invoke_depth());
 
-    let result = process_instruction(program_id, instruction_data, invoke_context);
+    let result = process_instruction(first_instruction_account, instruction_data, invoke_context);
 
+    let program_id = invoke_context.get_caller()?;
     match &result {
         Ok(()) => stable_log::program_success(&logger, program_id),
         Err(err) => stable_log::program_failure(&logger, program_id, err),
@@ -31,10 +35,12 @@ fn process_instruction_with_program_logging(
 
 macro_rules! with_program_logging {
     ($process_instruction:expr) => {
-        |program_id: &Pubkey, instruction_data: &[u8], invoke_context: &mut dyn InvokeContext| {
+        |first_instruction_account: usize,
+         instruction_data: &[u8],
+         invoke_context: &mut dyn InvokeContext| {
             process_instruction_with_program_logging(
                 $process_instruction,
-                program_id,
+                first_instruction_account,
                 instruction_data,
                 invoke_context,
             )
@@ -46,6 +52,7 @@ macro_rules! with_program_logging {
 pub enum ActivationType {
     NewProgram,
     NewVersion,
+    RemoveProgram,
 }
 
 #[derive(Clone)]
@@ -91,7 +98,7 @@ pub struct Builtins {
     /// Builtin programs that are always available
     pub genesis_builtins: Vec<Builtin>,
 
-    /// Builtin programs activated dynamically by feature
+    /// Builtin programs activated or deactivated dynamically by feature
     pub feature_builtins: Vec<(Builtin, Pubkey, ActivationType)>,
 }
 
@@ -121,9 +128,18 @@ fn genesis_builtins() -> Vec<Builtin> {
         Builtin::new(
             "secp256k1_program",
             solana_sdk::secp256k1_program::id(),
-            solana_secp256k1_program::process_instruction,
+            dummy_process_instruction,
         ),
     ]
+}
+
+/// place holder for secp256k1, remove when the precompile program is deactivated via feature activation
+fn dummy_process_instruction(
+    _first_instruction_account: usize,
+    _data: &[u8],
+    _invoke_context: &mut dyn InvokeContext,
+) -> Result<(), InstructionError> {
+    Ok(())
 }
 
 /// Builtin programs activated dynamically by feature
@@ -145,14 +161,17 @@ fn feature_builtins() -> Vec<(Builtin, Pubkey, ActivationType)> {
             feature_set::tx_wide_compute_cap::id(),
             ActivationType::NewProgram,
         ),
+        // TODO when feature `prevent_calling_precompiles_as_programs` is
+        // cleaned up also remove "secp256k1_program" from the main builtins
+        // list
         (
             Builtin::new(
-                "ed25519_program",
-                solana_sdk::ed25519_program::id(),
-                solana_ed25519_program::process_instruction,
+                "secp256k1_program",
+                solana_sdk::secp256k1_program::id(),
+                dummy_process_instruction,
             ),
-            feature_set::ed25519_program_enabled::id(),
-            ActivationType::NewProgram,
+            feature_set::prevent_calling_precompiles_as_programs::id(),
+            ActivationType::RemoveProgram,
         ),
     ]
 }

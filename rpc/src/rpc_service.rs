@@ -496,21 +496,14 @@ mod tests {
         crate::rpc::create_validator_exit,
         solana_gossip::{
             contact_info::ContactInfo,
-            crds_value::{CrdsData, CrdsValue, SnapshotHash},
+            crds_value::{CrdsData, CrdsValue, SnapshotHashes},
         },
         solana_ledger::{
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
             get_tmp_ledger_path,
         },
-        solana_runtime::{
-            bank::Bank,
-            snapshot_utils::{
-                ArchiveFormat, SnapshotVersion, DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN,
-                DEFAULT_MAX_INCREMENTAL_SNAPSHOT_ARCHIVES_TO_RETAIN,
-            },
-        },
+        solana_runtime::bank::Bank,
         solana_sdk::{
-            clock::Slot,
             genesis_config::{ClusterType, DEFAULT_GENESIS_ARCHIVE},
             signature::Signer,
             signer::keypair::Keypair,
@@ -615,18 +608,7 @@ mod tests {
         );
         let rrm_with_snapshot_config = RpcRequestMiddleware::new(
             PathBuf::from("/"),
-            Some(SnapshotConfig {
-                full_snapshot_archive_interval_slots: Slot::MAX,
-                incremental_snapshot_archive_interval_slots: Slot::MAX,
-                snapshot_archives_dir: PathBuf::from("/"),
-                bank_snapshots_dir: PathBuf::from("/"),
-                archive_format: ArchiveFormat::TarBzip2,
-                snapshot_version: SnapshotVersion::default(),
-                maximum_full_snapshot_archives_to_retain:
-                    DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN,
-                maximum_incremental_snapshot_archives_to_retain:
-                    DEFAULT_MAX_INCREMENTAL_SNAPSHOT_ARCHIVES_TO_RETAIN,
-            }),
+            Some(SnapshotConfig::default()),
             bank_forks,
             RpcHealth::stub(),
         );
@@ -802,7 +784,7 @@ mod tests {
             .write()
             .unwrap()
             .insert(
-                CrdsValue::new_unsigned(CrdsData::AccountsHashes(SnapshotHash::new(
+                CrdsValue::new_unsigned(CrdsData::AccountsHashes(SnapshotHashes::new(
                     trusted_validators[0],
                     vec![
                         (1, Hash::default()),
@@ -822,7 +804,7 @@ mod tests {
             .write()
             .unwrap()
             .insert(
-                CrdsValue::new_unsigned(CrdsData::AccountsHashes(SnapshotHash::new(
+                CrdsValue::new_unsigned(CrdsData::AccountsHashes(SnapshotHashes::new(
                     trusted_validators[1],
                     vec![(1000 + health_check_slot_distance - 1, Hash::default())],
                 ))),
@@ -838,7 +820,7 @@ mod tests {
             .write()
             .unwrap()
             .insert(
-                CrdsValue::new_unsigned(CrdsData::AccountsHashes(SnapshotHash::new(
+                CrdsValue::new_unsigned(CrdsData::AccountsHashes(SnapshotHashes::new(
                     trusted_validators[2],
                     vec![(1000 + health_check_slot_distance, Hash::default())],
                 ))),

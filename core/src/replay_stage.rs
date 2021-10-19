@@ -43,7 +43,7 @@ use {
     },
     solana_runtime::{
         accounts_background_service::AbsRequestSender, bank::Bank, bank::ExecuteTimings,
-        bank_forks::BankForks, commitment::BlockCommitmentCache,
+        bank::NewBankOptions, bank_forks::BankForks, commitment::BlockCommitmentCache,
         vote_sender_types::ReplayVoteSender,
     },
     solana_sdk::{
@@ -132,6 +132,7 @@ pub struct ReplayStageConfig {
     pub wait_for_vote_to_start_leader: bool,
     pub ancestor_hashes_replay_update_sender: AncestorHashesReplayUpdateSender,
     pub tower_storage: Arc<dyn TowerStorage>,
+    pub disable_epoch_boundary_optimization: bool,
 }
 
 #[derive(Default)]
@@ -341,6 +342,7 @@ impl ReplayStage {
             wait_for_vote_to_start_leader,
             ancestor_hashes_replay_update_sender,
             tower_storage,
+            disable_epoch_boundary_optimization,
         } = config;
 
         trace!("replay stage");
@@ -769,6 +771,7 @@ impl ReplayStage {
                             &retransmit_slots_sender,
                             &mut skipped_slots_info,
                             has_new_vote_been_rooted,
+                            disable_epoch_boundary_optimization,
                         );
 
                         let poh_bank = poh_recorder.lock().unwrap().bank();
@@ -1341,6 +1344,7 @@ impl ReplayStage {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn maybe_start_leader(
         my_pubkey: &Pubkey,
         bank_forks: &Arc<RwLock<BankForks>>,
@@ -1351,6 +1355,7 @@ impl ReplayStage {
         retransmit_slots_sender: &RetransmitSlotsSender,
         skipped_slots_info: &mut SkippedSlotsInfo,
         has_new_vote_been_rooted: bool,
+        disable_epoch_boundary_optimization: bool,
     ) {
         // all the individual calls to poh_recorder.lock() are designed to
         // increase granularity, decrease contention
@@ -1453,12 +1458,25 @@ impl ReplayStage {
                 poh_slot, parent_slot, root_slot
             );
 
+            let root_distance = poh_slot - root_slot;
+            const MAX_ROOT_DISTANCE_FOR_VOTE_ONLY: Slot = 500;
+            let vote_only_bank = if root_distance > MAX_ROOT_DISTANCE_FOR_VOTE_ONLY {
+                datapoint_info!("vote-only-bank", ("slot", poh_slot, i64));
+                true
+            } else {
+                false
+            };
+
             let tpu_bank = Self::new_bank_from_parent_with_notify(
                 &parent,
                 poh_slot,
                 root_slot,
                 my_pubkey,
                 rpc_subscriptions,
+                NewBankOptions {
+                    vote_only_bank,
+                    disable_epoch_boundary_optimization,
+                },
             );
 
             let tpu_bank = bank_forks.write().unwrap().insert(tpu_bank);
@@ -1930,7 +1948,7 @@ impl ReplayStage {
         poh_recorder
             .lock()
             .unwrap()
-            .reset(bank.last_blockhash(), bank.slot(), next_leader_slot);
+            .reset(bank.clone(), next_leader_slot);
 
         let next_leader_msg = if let Some(next_leader_slot) = next_leader_slot {
             format!("My next leader slot is {}", next_leader_slot.0)
@@ -2784,6 +2802,7 @@ impl ReplayStage {
                     forks.root(),
                     &leader,
                     rpc_subscriptions,
+                    NewBankOptions::default(),
                 );
                 let empty: Vec<Pubkey> = vec![];
                 Self::update_fork_propagated_threshold_from_votes(
@@ -2810,9 +2829,10 @@ impl ReplayStage {
         root_slot: u64,
         leader: &Pubkey,
         rpc_subscriptions: &Arc<RpcSubscriptions>,
+        new_bank_options: NewBankOptions,
     ) -> Bank {
         rpc_subscriptions.notify_slot(slot, parent.slot(), root_slot);
-        Bank::new_from_parent(parent, leader, slot)
+        Bank::new_from_parent_with_options(parent, leader, slot, new_bank_options)
     }
 
     fn record_rewards(bank: &Bank, rewards_recorder_sender: &Option<RewardsRecorderSender>) {
@@ -2978,7 +2998,7 @@ pub mod tests {
             PohRecorder::new(
                 working_bank.tick_height(),
                 working_bank.last_blockhash(),
-                working_bank.slot(),
+                working_bank.clone(),
                 None,
                 working_bank.ticks_per_slot(),
                 &Pubkey::default(),
@@ -3002,7 +3022,7 @@ pub mod tests {
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(bank_forks);
         let exit = Arc::new(AtomicBool::new(false));
-        let rpc_subscriptions = Arc::new(RpcSubscriptions::new(
+        let rpc_subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             &exit,
             bank_forks.clone(),
             Arc::new(RwLock::new(BlockCommitmentCache::default())),
@@ -3515,7 +3535,7 @@ pub mod tests {
             let bank1 = Bank::new_from_parent(&bank0, &Pubkey::default(), 1);
             bank_forks.write().unwrap().insert(bank1);
             let bank1 = bank_forks.read().unwrap().get(1).cloned().unwrap();
-            let mut bank1_progress = progress
+            let bank1_progress = progress
                 .entry(bank1.slot())
                 .or_insert_with(|| ForkProgress::new(bank1.last_blockhash(), None, None, 0, 0));
             let shreds = shred_to_insert(
@@ -3528,12 +3548,12 @@ pub mod tests {
             let res = ReplayStage::replay_blockstore_into_bank(
                 &bank1,
                 &blockstore,
-                &mut bank1_progress,
+                bank1_progress,
                 None,
                 &replay_vote_sender,
                 &VerifyRecyclers::default(),
             );
-            let rpc_subscriptions = Arc::new(RpcSubscriptions::new(
+            let rpc_subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
                 &exit,
                 bank_forks.clone(),
                 block_commitment_cache,
@@ -3601,7 +3621,7 @@ pub mod tests {
 
         let exit = Arc::new(AtomicBool::new(false));
         let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
-        let rpc_subscriptions = Arc::new(RpcSubscriptions::new(
+        let rpc_subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             &exit,
             bank_forks.clone(),
             block_commitment_cache.clone(),
@@ -3903,7 +3923,7 @@ pub mod tests {
             .values()
             .cloned()
             .collect();
-        let mut heaviest_subtree_fork_choice = &mut vote_simulator.heaviest_subtree_fork_choice;
+        let heaviest_subtree_fork_choice = &mut vote_simulator.heaviest_subtree_fork_choice;
         let mut latest_validator_votes_for_frozen_banks =
             LatestValidatorVotesForFrozenBanks::default();
         let ancestors = vote_simulator.bank_forks.read().unwrap().ancestors();
@@ -3918,7 +3938,7 @@ pub mod tests {
             &VoteTracker::default(),
             &ClusterSlots::default(),
             &vote_simulator.bank_forks,
-            &mut heaviest_subtree_fork_choice,
+            heaviest_subtree_fork_choice,
             &mut latest_validator_votes_for_frozen_banks,
         );
 
@@ -5574,20 +5594,11 @@ pub mod tests {
         let my_vote_pubkey = my_vote_keypair[0].pubkey();
         let bank0 = bank_forks.read().unwrap().get(0).unwrap().clone();
 
-        fn fill_bank_with_ticks(bank: &Bank) {
-            let parent_distance = bank.slot() - bank.parent_slot();
-            for _ in 0..parent_distance {
-                let last_blockhash = bank.last_blockhash();
-                while bank.last_blockhash() == last_blockhash {
-                    bank.register_tick(&Hash::new_unique())
-                }
-            }
-        }
         let (voting_sender, voting_receiver) = channel();
 
         // Simulate landing a vote for slot 0 landing in slot 1
         let bank1 = Arc::new(Bank::new_from_parent(&bank0, &Pubkey::default(), 1));
-        fill_bank_with_ticks(&bank1);
+        bank1.fill_bank_with_ticks();
         tower.record_bank_vote(&bank0, &my_vote_pubkey);
         ReplayStage::push_vote(
             &bank0,
@@ -5610,6 +5621,7 @@ pub mod tests {
             &poh_recorder,
             &tower_storage,
             vote_info,
+            false,
         );
 
         let mut cursor = Cursor::default();
@@ -5625,7 +5637,7 @@ pub mod tests {
         // Trying to refresh the vote for bank 0 in bank 1 or bank 2 won't succeed because
         // the last vote has landed already
         let bank2 = Arc::new(Bank::new_from_parent(&bank1, &Pubkey::default(), 2));
-        fill_bank_with_ticks(&bank2);
+        bank2.fill_bank_with_ticks();
         bank2.freeze();
         for refresh_bank in &[&bank1, &bank2] {
             ReplayStage::refresh_last_vote(
@@ -5673,6 +5685,7 @@ pub mod tests {
             &poh_recorder,
             &tower_storage,
             vote_info,
+            false,
         );
         let (_, votes) = cluster_info.get_votes(&mut cursor);
         assert_eq!(votes.len(), 1);
@@ -5708,7 +5721,7 @@ pub mod tests {
             &Pubkey::default(),
             bank2.slot() + MAX_PROCESSING_AGE as Slot,
         ));
-        fill_bank_with_ticks(&expired_bank);
+        expired_bank.fill_bank_with_ticks();
         expired_bank.freeze();
 
         // Now trying to refresh the vote for slot 1 will succeed because the recent blockhash
@@ -5740,6 +5753,7 @@ pub mod tests {
             &poh_recorder,
             &tower_storage,
             vote_info,
+            false,
         );
 
         assert!(last_vote_refresh_time.last_refresh_time > clone_refresh_time);
@@ -5770,7 +5784,7 @@ pub mod tests {
             vote_account.vote_state().as_ref().unwrap().tower(),
             vec![0, 1]
         );
-        fill_bank_with_ticks(&expired_bank_child);
+        expired_bank_child.fill_bank_with_ticks();
         expired_bank_child.freeze();
 
         // Trying to refresh the vote on a sibling bank where:
@@ -5782,7 +5796,7 @@ pub mod tests {
             &Pubkey::default(),
             expired_bank_child.slot() + 1,
         ));
-        fill_bank_with_ticks(&expired_bank_sibling);
+        expired_bank_sibling.fill_bank_with_ticks();
         expired_bank_sibling.freeze();
         // Set the last refresh to now, shouldn't refresh because the last refresh just happened.
         last_vote_refresh_time.last_refresh_time = Instant::now();

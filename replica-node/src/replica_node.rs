@@ -2,7 +2,7 @@ use {
     crate::accountsdb_repl_service::AccountsDbReplService,
     crossbeam_channel::unbounded,
     log::*,
-    solana_download_utils::download_snapshot,
+    solana_download_utils::download_snapshot_archive,
     solana_genesis_utils::download_then_check_genesis_hash,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_ledger::{
@@ -21,12 +21,9 @@ use {
         rpc_subscriptions::RpcSubscriptions,
     },
     solana_runtime::{
-        accounts_index::AccountSecondaryIndexes,
-        bank_forks::BankForks,
-        commitment::BlockCommitmentCache,
-        hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
-        snapshot_config::SnapshotConfig,
-        snapshot_utils::{self, ArchiveFormat},
+        accounts_index::AccountSecondaryIndexes, bank_forks::BankForks,
+        commitment::BlockCommitmentCache, hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+        snapshot_config::SnapshotConfig, snapshot_package::SnapshotType, snapshot_utils,
     },
     solana_sdk::{clock::Slot, exit::Exit, genesis_config::GenesisConfig, hash::Hash},
     solana_streamer::socket::SocketAddrSpace,
@@ -89,13 +86,14 @@ fn initialize_from_snapshot(
         replica_config.snapshot_archives_dir
     );
 
-    download_snapshot(
+    download_snapshot_archive(
         &replica_config.rpc_peer_addr,
         &replica_config.snapshot_archives_dir,
         replica_config.snapshot_info,
-        false,
+        SnapshotType::FullSnapshot,
         snapshot_config.maximum_full_snapshot_archives_to_retain,
         snapshot_config.maximum_incremental_snapshot_archives_to_retain,
+        false,
         &mut None,
     )
     .unwrap();
@@ -135,6 +133,7 @@ fn initialize_from_snapshot(
         false,
         process_options.verify_index,
         process_options.accounts_db_config,
+        None,
     )
     .unwrap();
 
@@ -210,6 +209,17 @@ fn start_client_rpc_services(
         ));
     }
 
+    let (trigger, pubsub_service) = PubSubService::new(
+        replica_config.pubsub_config.clone(),
+        &subscriptions,
+        replica_config.rpc_pubsub_addr,
+    );
+    replica_config
+        .replica_exit
+        .write()
+        .unwrap()
+        .register_exit(Box::new(move || trigger.cancel()));
+
     let (_bank_notification_sender, bank_notification_receiver) = unbounded();
     (
         Some(JsonRpcService::new(
@@ -233,18 +243,13 @@ fn start_client_rpc_services(
             leader_schedule_cache.clone(),
             max_complete_transaction_status_slot,
         )),
-        Some(PubSubService::new(
-            replica_config.pubsub_config.clone(),
-            &subscriptions,
-            replica_config.rpc_pubsub_addr,
-            &exit,
-        )),
+        Some(pubsub_service),
         Some(OptimisticallyConfirmedBankTracker::new(
             bank_notification_receiver,
             &exit,
             bank_forks.clone(),
             optimistically_confirmed_bank.clone(),
-            subscriptions.clone(),
+            subscriptions,
             None,
         )),
     )
@@ -263,16 +268,11 @@ impl ReplicaNode {
         .unwrap();
 
         let snapshot_config = SnapshotConfig {
-            full_snapshot_archive_interval_slots: std::u64::MAX,
-            incremental_snapshot_archive_interval_slots: std::u64::MAX,
+            full_snapshot_archive_interval_slots: Slot::MAX,
+            incremental_snapshot_archive_interval_slots: Slot::MAX,
             snapshot_archives_dir: replica_config.snapshot_archives_dir.clone(),
             bank_snapshots_dir: replica_config.bank_snapshots_dir.clone(),
-            archive_format: ArchiveFormat::TarBzip2,
-            snapshot_version: snapshot_utils::SnapshotVersion::default(),
-            maximum_full_snapshot_archives_to_retain:
-                snapshot_utils::DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN,
-            maximum_incremental_snapshot_archives_to_retain:
-                snapshot_utils::DEFAULT_MAX_INCREMENTAL_SNAPSHOT_ARCHIVES_TO_RETAIN,
+            ..SnapshotConfig::default()
         };
 
         let bank_info =

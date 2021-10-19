@@ -12,7 +12,6 @@ use crate::{
     cluster_slots::ClusterSlots,
     completed_data_sets_service::CompletedDataSetsSender,
     consensus::Tower,
-    cost_model::CostModel,
     cost_update_service::CostUpdateService,
     ledger_cleanup_service::LedgerCleanupService,
     replay_stage::{ReplayStage, ReplayStageConfig},
@@ -43,6 +42,7 @@ use solana_runtime::{
     bank::ExecuteTimings,
     bank_forks::BankForks,
     commitment::BlockCommitmentCache,
+    cost_model::CostModel,
     snapshot_config::SnapshotConfig,
     snapshot_package::{AccountsPackageReceiver, AccountsPackageSender, PendingSnapshotPackage},
     vote_sender_types::ReplayVoteSender,
@@ -94,6 +94,7 @@ pub struct TvuConfig {
     pub rocksdb_max_compaction_jitter: Option<u64>,
     pub wait_for_vote_to_start_leader: bool,
     pub accounts_shrink_ratio: AccountShrinkThreshold,
+    pub disable_epoch_boundary_optimization: bool,
 }
 
 impl Tvu {
@@ -224,6 +225,7 @@ impl Tvu {
             tvu_config.halt_on_trusted_validators_accounts_hash_mismatch,
             tvu_config.accounts_hash_fault_injection_slots,
             snapshot_config.clone(),
+            blockstore.ledger_path().to_path_buf(),
         );
 
         let (snapshot_request_sender, snapshot_request_handler) = match snapshot_config {
@@ -281,6 +283,7 @@ impl Tvu {
             wait_for_vote_to_start_leader: tvu_config.wait_for_vote_to_start_leader,
             ancestor_hashes_replay_update_sender,
             tower_storage: tower_storage.clone(),
+            disable_epoch_boundary_optimization: tvu_config.disable_epoch_boundary_optimization,
         };
 
         let (voting_sender, voting_receiver) = channel();
@@ -289,6 +292,7 @@ impl Tvu {
             cluster_info.clone(),
             poh_recorder.clone(),
             tower_storage,
+            bank_forks.clone(),
         );
 
         let (cost_update_sender, cost_update_receiver): (
@@ -451,7 +455,7 @@ pub mod tests {
             },
             blockstore,
             ledger_signal_receiver,
-            &Arc::new(RpcSubscriptions::new(
+            &Arc::new(RpcSubscriptions::new_for_tests(
                 &exit,
                 bank_forks.clone(),
                 block_commitment_cache.clone(),

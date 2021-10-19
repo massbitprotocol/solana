@@ -23,10 +23,9 @@ use {
         crds_gossip_error::CrdsGossipError,
         crds_gossip_pull::{CrdsFilter, ProcessPullStats, CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS},
         crds_value::{
-            self, CrdsData, CrdsValue, CrdsValueLabel, EpochSlotsIndex, LowestSlot, NodeInstance,
-            SnapshotHash, Version, Vote, MAX_WALLCLOCK,
+            self, CrdsData, CrdsValue, CrdsValueLabel, EpochSlotsIndex, IncrementalSnapshotHashes,
+            LowestSlot, NodeInstance, SnapshotHashes, Version, Vote, MAX_WALLCLOCK,
         },
-        data_budget::DataBudget,
         epoch_slots::EpochSlots,
         gossip_error::GossipError,
         ping_pong::{self, PingCache, Pong},
@@ -45,6 +44,7 @@ use {
         bind_common, bind_common_in_range, bind_in_range, find_available_port_in_range,
         multi_bind_in_range, PortRange,
     },
+    solana_perf::data_budget::DataBudget,
     solana_perf::packet::{
         limited_deserialize, to_packets_with_destination, Packet, Packets, PacketsRecycler,
         PACKET_DATA_SIZE,
@@ -115,6 +115,10 @@ const DUPLICATE_SHRED_MAX_PAYLOAD_SIZE: usize = PACKET_DATA_SIZE - 115;
 /// PACKET_DATA_SIZE.
 // TODO: Update this to 26 once payload sizes are upgraded across fleet.
 pub const MAX_SNAPSHOT_HASHES: usize = 16;
+/// Maximum number of hashes in IncrementalSnapshotHashes a node publishes
+/// such that the serialized size of the push/pull message stays below
+/// PACKET_DATA_SIZE.
+pub const MAX_INCREMENTAL_SNAPSHOT_HASHES: usize = 25;
 /// Maximum number of origin nodes that a PruneData may contain, such that the
 /// serialized size of the PruneMessage stays below PACKET_DATA_SIZE.
 const MAX_PRUNE_DATA_NODES: usize = 32;
@@ -140,6 +144,7 @@ pub enum ClusterInfoError {
     NoLeader,
     BadContactInfo,
     BadGossipAddress,
+    TooManyIncrementalSnapshotHashes,
 }
 
 pub struct ClusterInfo {
@@ -247,14 +252,14 @@ pub fn make_accounts_hashes_message(
     keypair: &Keypair,
     accounts_hashes: Vec<(Slot, Hash)>,
 ) -> Option<CrdsValue> {
-    let message = CrdsData::AccountsHashes(SnapshotHash::new(keypair.pubkey(), accounts_hashes));
+    let message = CrdsData::AccountsHashes(SnapshotHashes::new(keypair.pubkey(), accounts_hashes));
     Some(CrdsValue::new_signed(message, keypair))
 }
 
 pub(crate) type Ping = ping_pong::Ping<[u8; GOSSIP_PING_TOKEN_SIZE]>;
 
 // TODO These messages should go through the gpu pipeline for spam filtering
-#[frozen_abi(digest = "AqKhoLDkFr85WPiZnXG4bcRwHU4qSSyDZ3MQZLk3cnJf")]
+#[frozen_abi(digest = "4VqzaZbxQkeTgo916HVoLtaWoM8bbGaQZy6Qgw7K9kLf")]
 #[derive(Serialize, Deserialize, Debug, AbiEnumVisitor, AbiExample)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Protocol {
@@ -371,7 +376,7 @@ fn retain_staked(values: &mut Vec<CrdsValue>, stakes: &HashMap<Pubkey, u64>) {
             // Unstaked nodes can still help repair.
             CrdsData::EpochSlots(_, _) => true,
             // Unstaked nodes can still serve snapshots.
-            CrdsData::SnapshotHashes(_) => true,
+            CrdsData::SnapshotHashes(_) | CrdsData::IncrementalSnapshotHashes(_) => true,
             // Otherwise unstaked voting nodes will show up with no version in
             // the various dashboards.
             CrdsData::Version(_) => true,
@@ -765,7 +770,7 @@ impl ClusterInfo {
                     };
                     let ip_addr = node.gossip.ip();
                     Some(format!(
-                        "{:15} {:2}| {:5} | {:44} |{:^9}| {:5}| {:5}| {:5}| {:5}| {:5}| {:5}| {:5}| {}\n",
+                        "{:15} {:2}| {:5} | {:44} |{:^9}| {:5}| {:5}| {:5}| {:5}| {:5}| {:5}| {:5}| {:5}| {}\n",
                         if ContactInfo::is_valid_address(&node.gossip, &self.socket_addr_space) {
                             ip_addr.to_string()
                         } else {
@@ -780,6 +785,7 @@ impl ClusterInfo {
                             "-".to_string()
                         },
                         addr_to_string(&ip_addr, &node.gossip),
+                        addr_to_string(&ip_addr, &node.tpu_vote),
                         addr_to_string(&ip_addr, &node.tpu),
                         addr_to_string(&ip_addr, &node.tpu_forwards),
                         addr_to_string(&ip_addr, &node.tvu),
@@ -794,9 +800,9 @@ impl ClusterInfo {
 
         format!(
             "IP Address        |Age(ms)| Node identifier                              \
-             | Version |Gossip| TPU  |TPUfwd| TVU  |TVUfwd|Repair|ServeR|ShredVer\n\
+             | Version |Gossip|TPUvote| TPU  |TPUfwd| TVU  |TVUfwd|Repair|ServeR|ShredVer\n\
              ------------------+-------+----------------------------------------------+---------+\
-             ------+------+------+------+------+------+------+--------\n\
+             ------+------+-------+------+------+------+------+------+--------\n\
              {}\
              Nodes: {}{}{}",
             nodes.join(""),
@@ -932,7 +938,7 @@ impl ClusterInfo {
             return;
         }
 
-        let message = CrdsData::AccountsHashes(SnapshotHash::new(self.id(), accounts_hashes));
+        let message = CrdsData::AccountsHashes(SnapshotHashes::new(self.id(), accounts_hashes));
         self.push_message(CrdsValue::new_signed(message, &self.keypair()));
     }
 
@@ -945,8 +951,28 @@ impl ClusterInfo {
             return;
         }
 
-        let message = CrdsData::SnapshotHashes(SnapshotHash::new(self.id(), snapshot_hashes));
+        let message = CrdsData::SnapshotHashes(SnapshotHashes::new(self.id(), snapshot_hashes));
         self.push_message(CrdsValue::new_signed(message, &self.keypair()));
+    }
+
+    pub fn push_incremental_snapshot_hashes(
+        &self,
+        base: (Slot, Hash),
+        hashes: Vec<(Slot, Hash)>,
+    ) -> Result<(), ClusterInfoError> {
+        if hashes.len() > MAX_INCREMENTAL_SNAPSHOT_HASHES {
+            return Err(ClusterInfoError::TooManyIncrementalSnapshotHashes);
+        }
+
+        let message = CrdsData::IncrementalSnapshotHashes(IncrementalSnapshotHashes {
+            from: self.id(),
+            base,
+            hashes,
+            wallclock: timestamp(),
+        });
+        self.push_message(CrdsValue::new_signed(message, &self.keypair()));
+
+        Ok(())
     }
 
     pub fn push_vote_at_index(&self, vote: Transaction, vote_index: u8) {
@@ -1111,8 +1137,20 @@ impl ClusterInfo {
         F: FnOnce(&Vec<(Slot, Hash)>) -> Y,
     {
         let gossip_crds = self.gossip.crds.read().unwrap();
-        let hashes = &gossip_crds.get::<&SnapshotHash>(*pubkey)?.hashes;
+        let hashes = &gossip_crds.get::<&SnapshotHashes>(*pubkey)?.hashes;
         Some(map(hashes))
+    }
+
+    pub fn get_incremental_snapshot_hashes_for_node(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<IncrementalSnapshotHashes> {
+        self.gossip
+            .crds
+            .read()
+            .unwrap()
+            .get::<&IncrementalSnapshotHashes>(*pubkey)
+            .cloned()
     }
 
     /// Returns epoch-slots inserted since the given cursor.
@@ -2181,7 +2219,12 @@ impl ClusterInfo {
             messages
                 .into_iter()
                 .flat_map(|(from, crds_values)| {
-                    self.gossip.process_push_message(&from, crds_values, now)
+                    let (num_success, origins) =
+                        self.gossip.process_push_message(&from, crds_values, now);
+                    self.stats
+                        .process_push_success
+                        .add_relaxed(num_success as u64);
+                    origins
                 })
                 .collect()
         };
@@ -2628,27 +2671,27 @@ fn get_epoch_duration(bank_forks: Option<&RwLock<BankForks>>) -> Duration {
 ///      1 - also check if there are nodes in the next layer and repeat the layer 1 to layer 2 logic
 
 /// Returns Neighbor Nodes and Children Nodes `(neighbors, children)` for a given node based on its stake
-pub fn compute_retransmit_peers(
+pub fn compute_retransmit_peers<T: Copy>(
     fanout: usize,
-    node: usize,
-    index: &[usize],
-) -> (Vec<usize> /*neighbors*/, Vec<usize> /*children*/) {
+    index: usize, // Local node's index withing the nodes slice.
+    nodes: &[T],
+) -> (Vec<T> /*neighbors*/, Vec<T> /*children*/) {
     // 1st layer: fanout    nodes starting at 0
     // 2nd layer: fanout**2 nodes starting at fanout
     // 3rd layer: fanout**3 nodes starting at fanout + fanout**2
     // ...
     // Each layer is divided into neighborhoods of fanout nodes each.
-    let offset = node % fanout; // Node's index within its neighborhood.
-    let anchor = node - offset; // First node in the neighborhood.
+    let offset = index % fanout; // Node's index within its neighborhood.
+    let anchor = index - offset; // First node in the neighborhood.
     let neighbors = (anchor..)
         .take(fanout)
-        .map(|i| index.get(i).copied())
+        .map(|i| nodes.get(i).copied())
         .while_some()
         .collect();
     let children = ((anchor + 1) * fanout + offset..)
         .step_by(fanout)
         .take(fanout)
-        .map(|i| index.get(i).copied())
+        .map(|i| nodes.get(i).copied())
         .while_some()
         .collect();
     (neighbors, children)
@@ -2662,6 +2705,7 @@ pub struct Sockets {
     pub tvu_forwards: Vec<UdpSocket>,
     pub tpu: Vec<UdpSocket>,
     pub tpu_forwards: Vec<UdpSocket>,
+    pub tpu_vote: Vec<UdpSocket>,
     pub broadcast: Vec<UdpSocket>,
     pub repair: UdpSocket,
     pub retransmit_sockets: Vec<UdpSocket>,
@@ -2688,6 +2732,7 @@ impl Node {
         let tvu = UdpSocket::bind("127.0.0.1:0").unwrap();
         let tvu_forwards = UdpSocket::bind("127.0.0.1:0").unwrap();
         let tpu_forwards = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tpu_vote = UdpSocket::bind("127.0.0.1:0").unwrap();
         let repair = UdpSocket::bind("127.0.0.1:0").unwrap();
         let rpc_port = find_available_port_in_range(bind_ip_addr, (1024, 65535)).unwrap();
         let rpc_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), rpc_port);
@@ -2698,7 +2743,6 @@ impl Node {
         let broadcast = vec![UdpSocket::bind("0.0.0.0:0").unwrap()];
         let retransmit_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
         let serve_repair = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let unused = UdpSocket::bind("0.0.0.0:0").unwrap();
         let info = ContactInfo {
             id: *pubkey,
             gossip: gossip_addr,
@@ -2707,7 +2751,7 @@ impl Node {
             repair: repair.local_addr().unwrap(),
             tpu: tpu.local_addr().unwrap(),
             tpu_forwards: tpu_forwards.local_addr().unwrap(),
-            unused: unused.local_addr().unwrap(),
+            tpu_vote: tpu_vote.local_addr().unwrap(),
             rpc: rpc_addr,
             rpc_pubsub: rpc_pubsub_addr,
             serve_repair: serve_repair.local_addr().unwrap(),
@@ -2723,6 +2767,7 @@ impl Node {
                 tvu_forwards: vec![tvu_forwards],
                 tpu: vec![tpu],
                 tpu_forwards: vec![tpu_forwards],
+                tpu_vote: vec![tpu_vote],
                 broadcast,
                 repair,
                 retransmit_sockets: vec![retransmit_socket],
@@ -2763,6 +2808,7 @@ impl Node {
         let (tvu_forwards_port, tvu_forwards) = Self::bind(bind_ip_addr, port_range);
         let (tpu_port, tpu) = Self::bind(bind_ip_addr, port_range);
         let (tpu_forwards_port, tpu_forwards) = Self::bind(bind_ip_addr, port_range);
+        let (tpu_vote_port, tpu_vote) = Self::bind(bind_ip_addr, port_range);
         let (_, retransmit_socket) = Self::bind(bind_ip_addr, port_range);
         let (repair_port, repair) = Self::bind(bind_ip_addr, port_range);
         let (serve_repair_port, serve_repair) = Self::bind(bind_ip_addr, port_range);
@@ -2779,7 +2825,7 @@ impl Node {
             repair: SocketAddr::new(gossip_addr.ip(), repair_port),
             tpu: SocketAddr::new(gossip_addr.ip(), tpu_port),
             tpu_forwards: SocketAddr::new(gossip_addr.ip(), tpu_forwards_port),
-            unused: socketaddr_any!(),
+            tpu_vote: SocketAddr::new(gossip_addr.ip(), tpu_vote_port),
             rpc: SocketAddr::new(gossip_addr.ip(), rpc_port),
             rpc_pubsub: SocketAddr::new(gossip_addr.ip(), rpc_pubsub_port),
             serve_repair: SocketAddr::new(gossip_addr.ip(), serve_repair_port),
@@ -2797,6 +2843,7 @@ impl Node {
                 tvu_forwards: vec![tvu_forwards],
                 tpu: vec![tpu],
                 tpu_forwards: vec![tpu_forwards],
+                tpu_vote: vec![tpu_vote],
                 broadcast: vec![broadcast],
                 repair,
                 retransmit_sockets: vec![retransmit_socket],
@@ -2826,6 +2873,9 @@ impl Node {
         let (tpu_forwards_port, tpu_forwards_sockets) =
             multi_bind_in_range(bind_ip_addr, port_range, 8).expect("tpu_forwards multi_bind");
 
+        let (tpu_vote_port, tpu_vote_sockets) =
+            multi_bind_in_range(bind_ip_addr, port_range, 1).expect("tpu_vote multi_bind");
+
         let (_, retransmit_sockets) =
             multi_bind_in_range(bind_ip_addr, port_range, 8).expect("retransmit multi_bind");
 
@@ -2843,7 +2893,7 @@ impl Node {
             repair: SocketAddr::new(gossip_addr.ip(), repair_port),
             tpu: SocketAddr::new(gossip_addr.ip(), tpu_port),
             tpu_forwards: SocketAddr::new(gossip_addr.ip(), tpu_forwards_port),
-            unused: socketaddr_any!(),
+            tpu_vote: SocketAddr::new(gossip_addr.ip(), tpu_vote_port),
             rpc: socketaddr_any!(),
             rpc_pubsub: socketaddr_any!(),
             serve_repair: SocketAddr::new(gossip_addr.ip(), serve_repair_port),
@@ -2860,6 +2910,7 @@ impl Node {
                 tvu_forwards: tvu_forwards_sockets,
                 tpu: tpu_sockets,
                 tpu_forwards: tpu_forwards_sockets,
+                tpu_vote: tpu_vote_sockets,
                 broadcast,
                 repair,
                 retransmit_sockets,
@@ -3166,7 +3217,7 @@ mod tests {
     fn test_max_snapshot_hashes_with_push_messages() {
         let mut rng = rand::thread_rng();
         for _ in 0..256 {
-            let snapshot_hash = SnapshotHash::new_rand(&mut rng, None);
+            let snapshot_hash = SnapshotHashes::new_rand(&mut rng, None);
             let crds_value =
                 CrdsValue::new_signed(CrdsData::SnapshotHashes(snapshot_hash), &Keypair::new());
             let message = Protocol::PushMessage(Pubkey::new_unique(), vec![crds_value]);
@@ -3179,13 +3230,49 @@ mod tests {
     fn test_max_snapshot_hashes_with_pull_responses() {
         let mut rng = rand::thread_rng();
         for _ in 0..256 {
-            let snapshot_hash = SnapshotHash::new_rand(&mut rng, None);
+            let snapshot_hash = SnapshotHashes::new_rand(&mut rng, None);
             let crds_value =
                 CrdsValue::new_signed(CrdsData::AccountsHashes(snapshot_hash), &Keypair::new());
             let response = Protocol::PullResponse(Pubkey::new_unique(), vec![crds_value]);
             let socket = new_rand_socket_addr(&mut rng);
             assert!(Packet::from_data(Some(&socket), response).is_ok());
         }
+    }
+
+    #[test]
+    fn test_max_incremental_snapshot_hashes_with_push_messages() {
+        let mut rng = rand::thread_rng();
+        let incremental_snapshot_hashes = IncrementalSnapshotHashes {
+            from: Pubkey::new_unique(),
+            base: (Slot::default(), Hash::default()),
+            hashes: vec![(Slot::default(), Hash::default()); MAX_INCREMENTAL_SNAPSHOT_HASHES],
+            wallclock: timestamp(),
+        };
+        let crds_value = CrdsValue::new_signed(
+            CrdsData::IncrementalSnapshotHashes(incremental_snapshot_hashes),
+            &Keypair::new(),
+        );
+        let message = Protocol::PushMessage(Pubkey::new_unique(), vec![crds_value]);
+        let socket = new_rand_socket_addr(&mut rng);
+        assert!(Packet::from_data(Some(&socket), message).is_ok());
+    }
+
+    #[test]
+    fn test_max_incremental_snapshot_hashes_with_pull_responses() {
+        let mut rng = rand::thread_rng();
+        let incremental_snapshot_hashes = IncrementalSnapshotHashes {
+            from: Pubkey::new_unique(),
+            base: (Slot::default(), Hash::default()),
+            hashes: vec![(Slot::default(), Hash::default()); MAX_INCREMENTAL_SNAPSHOT_HASHES],
+            wallclock: timestamp(),
+        };
+        let crds_value = CrdsValue::new_signed(
+            CrdsData::IncrementalSnapshotHashes(incremental_snapshot_hashes),
+            &Keypair::new(),
+        );
+        let response = Protocol::PullResponse(Pubkey::new_unique(), vec![crds_value]);
+        let socket = new_rand_socket_addr(&mut rng);
+        assert!(Packet::from_data(Some(&socket), response).is_ok());
     }
 
     #[test]
@@ -3822,7 +3909,7 @@ mod tests {
     fn test_split_messages_packet_size() {
         // Test that if a value is smaller than payload size but too large to be wrapped in a vec
         // that it is still dropped
-        let mut value = CrdsValue::new_unsigned(CrdsData::SnapshotHashes(SnapshotHash {
+        let mut value = CrdsValue::new_unsigned(CrdsData::SnapshotHashes(SnapshotHashes {
             from: Pubkey::default(),
             hashes: vec![],
             wallclock: 0,
@@ -3830,7 +3917,7 @@ mod tests {
 
         let mut i = 0;
         while value.size() < PUSH_MESSAGE_MAX_PAYLOAD_SIZE as u64 {
-            value.data = CrdsData::SnapshotHashes(SnapshotHash {
+            value.data = CrdsData::SnapshotHashes(SnapshotHashes {
                 from: Pubkey::default(),
                 hashes: vec![(0, Hash::default()); i],
                 wallclock: 0,
