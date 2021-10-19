@@ -1,12 +1,15 @@
 #![cfg(feature = "full")]
 
+use itertools::Itertools;
 use solana_sdk::{
     account::AccountSharedData,
     compute_budget::ComputeBudget,
+    feature_set::remove_native_loader,
     fee_calculator::FeeCalculator,
     hash::Hash,
     instruction::{CompiledInstruction, Instruction, InstructionError},
     keyed_account::{create_keyed_accounts_unified, KeyedAccount},
+    message::Message,
     pubkey::Pubkey,
     sysvar::Sysvar,
 };
@@ -25,54 +28,69 @@ pub type LoaderEntrypoint = unsafe extern "C" fn(
 ) -> Result<(), InstructionError>;
 
 pub type ProcessInstructionWithContext =
-    fn(&Pubkey, &[u8], &mut dyn InvokeContext) -> Result<(), InstructionError>;
+    fn(usize, &[u8], &mut dyn InvokeContext) -> Result<(), InstructionError>;
 
 pub struct InvokeContextStackFrame<'a> {
-    pub key: Pubkey,
+    pub number_of_program_accounts: usize,
     pub keyed_accounts: Vec<KeyedAccount<'a>>,
     pub keyed_accounts_range: std::ops::Range<usize>,
 }
 
 impl<'a> InvokeContextStackFrame<'a> {
-    pub fn new(key: Pubkey, keyed_accounts: Vec<KeyedAccount<'a>>) -> Self {
+    pub fn new(number_of_program_accounts: usize, keyed_accounts: Vec<KeyedAccount<'a>>) -> Self {
         let keyed_accounts_range = std::ops::Range {
             start: 0,
             end: keyed_accounts.len(),
         };
         Self {
-            key,
+            number_of_program_accounts,
             keyed_accounts,
             keyed_accounts_range,
         }
+    }
+
+    pub fn program_id(&self) -> Option<&Pubkey> {
+        self.keyed_accounts
+            .get(self.number_of_program_accounts.saturating_sub(1))
+            .map(|keyed_account| keyed_account.unsigned_key())
     }
 }
 
 /// Invocation context passed to loaders
 pub trait InvokeContext {
     /// Push a stack frame onto the invocation stack
-    ///
-    /// Used in MessageProcessor::process_cross_program_instruction
     fn push(
         &mut self,
-        key: &Pubkey,
-        keyed_accounts: &[(bool, bool, &Pubkey, &RefCell<AccountSharedData>)],
+        message: &Message,
+        instruction: &CompiledInstruction,
+        program_indices: &[usize],
+        account_indices: Option<&[usize]>,
     ) -> Result<(), InstructionError>;
     /// Pop a stack frame from the invocation stack
-    ///
-    /// Used in MessageProcessor::process_cross_program_instruction
     fn pop(&mut self);
     /// Current depth of the invocation stake
     fn invoke_depth(&self) -> usize;
+    /// Verify the results of an instruction
+    fn verify(
+        &mut self,
+        message: &Message,
+        instruction: &CompiledInstruction,
+        program_indices: &[usize],
+    ) -> Result<(), InstructionError>;
     /// Verify and update PreAccount state based on program execution
     fn verify_and_update(
         &mut self,
         instruction: &CompiledInstruction,
-        accounts: &[(Pubkey, Rc<RefCell<AccountSharedData>>)],
+        account_indices: &[usize],
         write_privileges: &[bool],
     ) -> Result<(), InstructionError>;
     /// Get the program ID of the currently executing program
     fn get_caller(&self) -> Result<&Pubkey, InstructionError>;
     /// Removes the first keyed account
+    #[deprecated(
+        since = "1.9.0",
+        note = "To be removed together with remove_native_loader"
+    )]
     fn remove_first_keyed_account(&mut self) -> Result<(), InstructionError>;
     /// Get the list of keyed accounts
     fn get_keyed_accounts(&self) -> Result<&[KeyedAccount], InstructionError>;
@@ -80,10 +98,6 @@ pub trait InvokeContext {
     fn get_programs(&self) -> &[(Pubkey, ProcessInstructionWithContext)];
     /// Get this invocation's logger
     fn get_logger(&self) -> Rc<RefCell<dyn Logger>>;
-    /// Get this invocation's compute budget
-    #[allow(deprecated)]
-    #[deprecated(since = "1.8.0", note = "please use `get_compute_budget` instead")]
-    fn get_bpf_compute_budget(&self) -> &BpfComputeBudget;
     /// Get this invocation's compute meter
     fn get_compute_meter(&self) -> Rc<RefCell<dyn ComputeMeter>>;
     /// Loaders may need to do work in order to execute a program.  Cache
@@ -91,12 +105,14 @@ pub trait InvokeContext {
     fn add_executor(&self, pubkey: &Pubkey, executor: Arc<dyn Executor>);
     /// Get the completed loader work that can be re-used across executions
     fn get_executor(&self, pubkey: &Pubkey) -> Option<Arc<dyn Executor>>;
+    /// Set which instruction in the message is currently being recorded
+    fn set_instruction_index(&mut self, instruction_index: usize);
     /// Record invoked instruction
     fn record_instruction(&self, instruction: &Instruction);
     /// Get the bank's active feature set
     fn is_feature_active(&self, feature_id: &Pubkey) -> bool;
-    /// Get an account by its key
-    fn get_account(&self, pubkey: &Pubkey) -> Option<Rc<RefCell<AccountSharedData>>>;
+    /// Find an account_index and account by its key
+    fn get_account(&self, pubkey: &Pubkey) -> Option<(usize, Rc<RefCell<AccountSharedData>>)>;
     /// Update timing
     fn update_timing(
         &mut self,
@@ -113,6 +129,10 @@ pub trait InvokeContext {
     fn get_blockhash(&self) -> &Hash;
     /// Get this invocation's `FeeCalculator`
     fn get_fee_calculator(&self) -> &FeeCalculator;
+    /// Set the return data
+    fn set_return_data(&mut self, data: Vec<u8>) -> Result<(), InstructionError>;
+    /// Get the return data
+    fn get_return_data(&self) -> (Pubkey, &[u8]);
 }
 
 /// Convenience macro to log a message with an `Rc<RefCell<dyn Logger>>`
@@ -158,99 +178,6 @@ pub fn get_sysvar<T: Sysvar>(
         ic_msg!(invoke_context, "Unable to get sysvar {}: {:?}", id, err);
         InstructionError::UnsupportedSysvar
     })
-}
-
-#[deprecated(since = "1.8.0", note = "please use `ComputeBudget` instead")]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BpfComputeBudget {
-    /// Number of compute units that an instruction is allowed.  Compute units
-    /// are consumed by program execution, resources they use, etc...
-    pub max_units: u64,
-    /// Number of compute units consumed by a log_u64 call
-    pub log_64_units: u64,
-    /// Number of compute units consumed by a create_program_address call
-    pub create_program_address_units: u64,
-    /// Number of compute units consumed by an invoke call (not including the cost incurred by
-    /// the called program)
-    pub invoke_units: u64,
-    /// Maximum cross-program invocation depth allowed
-    pub max_invoke_depth: usize,
-    /// Base number of compute units consumed to call SHA256
-    pub sha256_base_cost: u64,
-    /// Incremental number of units consumed by SHA256 (based on bytes)
-    pub sha256_byte_cost: u64,
-    /// Maximum BPF to BPF call depth
-    pub max_call_depth: usize,
-    /// Size of a stack frame in bytes, must match the size specified in the LLVM BPF backend
-    pub stack_frame_size: usize,
-    /// Number of compute units consumed by logging a `Pubkey`
-    pub log_pubkey_units: u64,
-    /// Maximum cross-program invocation instruction size
-    pub max_cpi_instruction_size: usize,
-    /// Number of account data bytes per conpute unit charged during a cross-program invocation
-    pub cpi_bytes_per_unit: u64,
-    /// Base number of compute units consumed to get a sysvar
-    pub sysvar_base_cost: u64,
-    /// Number of compute units consumed to call secp256k1_recover
-    pub secp256k1_recover_cost: u64,
-    /// Optional program heap region size, if `None` then loader default
-    pub heap_size: Option<usize>,
-}
-#[allow(deprecated)]
-impl From<ComputeBudget> for BpfComputeBudget {
-    fn from(item: ComputeBudget) -> Self {
-        BpfComputeBudget {
-            max_units: item.max_units,
-            log_64_units: item.log_64_units,
-            create_program_address_units: item.create_program_address_units,
-            invoke_units: item.invoke_units,
-            max_invoke_depth: item.max_invoke_depth,
-            sha256_base_cost: item.sha256_base_cost,
-            sha256_byte_cost: item.sha256_byte_cost,
-            max_call_depth: item.max_call_depth,
-            stack_frame_size: item.stack_frame_size,
-            log_pubkey_units: item.log_pubkey_units,
-            max_cpi_instruction_size: item.max_cpi_instruction_size,
-            cpi_bytes_per_unit: item.cpi_bytes_per_unit,
-            sysvar_base_cost: item.sysvar_base_cost,
-            secp256k1_recover_cost: item.secp256k1_recover_cost,
-            heap_size: item.heap_size,
-        }
-    }
-}
-#[allow(deprecated)]
-impl From<BpfComputeBudget> for ComputeBudget {
-    fn from(item: BpfComputeBudget) -> Self {
-        ComputeBudget {
-            max_units: item.max_units,
-            log_64_units: item.log_64_units,
-            create_program_address_units: item.create_program_address_units,
-            invoke_units: item.invoke_units,
-            max_invoke_depth: item.max_invoke_depth,
-            sha256_base_cost: item.sha256_base_cost,
-            sha256_byte_cost: item.sha256_byte_cost,
-            max_call_depth: item.max_call_depth,
-            stack_frame_size: item.stack_frame_size,
-            log_pubkey_units: item.log_pubkey_units,
-            max_cpi_instruction_size: item.max_cpi_instruction_size,
-            cpi_bytes_per_unit: item.cpi_bytes_per_unit,
-            sysvar_base_cost: item.sysvar_base_cost,
-            secp256k1_recover_cost: item.secp256k1_recover_cost,
-            heap_size: item.heap_size,
-        }
-    }
-}
-#[allow(deprecated)]
-impl Default for BpfComputeBudget {
-    fn default() -> Self {
-        ComputeBudget::default().into()
-    }
-}
-#[allow(deprecated)]
-impl BpfComputeBudget {
-    pub fn new() -> Self {
-        BpfComputeBudget::default()
-    }
 }
 
 /// Compute meter
@@ -309,6 +236,42 @@ pub mod stable_log {
         ic_logger_msg!(logger, "Program log: {}", message);
     }
 
+    /// Emit a program data.
+    ///
+    /// The general form is:
+    ///
+    /// ```notrust
+    /// "Program data: <binary-data-in-base64>*"
+    /// ```
+    ///
+    /// That is, any program-generated output is guaranteed to be prefixed by "Program data: "
+    pub fn program_data(logger: &Rc<RefCell<dyn Logger>>, data: &[&[u8]]) {
+        ic_logger_msg!(
+            logger,
+            "Program data: {}",
+            data.iter().map(base64::encode).join(" ")
+        );
+    }
+
+    /// Log return data as from the program itself. This line will not be present if no return
+    /// data was set, or if the return data was set to zero length.
+    ///
+    /// The general form is:
+    ///
+    /// ```notrust
+    /// "Program return: <program-id> <program-generated-data-in-base64>"
+    /// ```
+    ///
+    /// That is, any program-generated output is guaranteed to be prefixed by "Program return: "
+    pub fn program_return(logger: &Rc<RefCell<dyn Logger>>, program_id: &Pubkey, data: &[u8]) {
+        ic_logger_msg!(
+            logger,
+            "Program return: {} {}",
+            program_id,
+            base64::encode(data)
+        );
+    }
+
     /// Log successful program execution.
     ///
     /// The general form is:
@@ -341,8 +304,7 @@ pub trait Executor: Debug + Send + Sync {
     /// Execute the program
     fn execute(
         &self,
-        loader_id: &Pubkey,
-        program_id: &Pubkey,
+        first_instruction_account: usize,
         instruction_data: &[u8],
         invoke_context: &mut dyn InvokeContext,
         use_jit: bool,
@@ -385,7 +347,6 @@ pub struct MockInvokeContext<'a> {
     pub invoke_stack: Vec<InvokeContextStackFrame<'a>>,
     pub logger: MockLogger,
     pub compute_budget: ComputeBudget,
-    pub bpf_compute_budget: BpfComputeBudget,
     pub compute_meter: MockComputeMeter,
     pub programs: Vec<(Pubkey, ProcessInstructionWithContext)>,
     pub accounts: Vec<(Pubkey, Rc<RefCell<AccountSharedData>>)>,
@@ -393,15 +354,16 @@ pub struct MockInvokeContext<'a> {
     pub disabled_features: HashSet<Pubkey>,
     pub blockhash: Hash,
     pub fee_calculator: FeeCalculator,
+    pub return_data: (Pubkey, Vec<u8>),
 }
+
 impl<'a> MockInvokeContext<'a> {
-    pub fn new(keyed_accounts: Vec<KeyedAccount<'a>>) -> Self {
+    pub fn new(program_id: &Pubkey, keyed_accounts: Vec<KeyedAccount<'a>>) -> Self {
         let compute_budget = ComputeBudget::default();
         let mut invoke_context = MockInvokeContext {
             invoke_stack: Vec::with_capacity(compute_budget.max_invoke_depth),
             logger: MockLogger::default(),
             compute_budget,
-            bpf_compute_budget: compute_budget.into(),
             compute_meter: MockComputeMeter {
                 remaining: std::i64::MAX as u64,
             },
@@ -411,11 +373,17 @@ impl<'a> MockInvokeContext<'a> {
             disabled_features: HashSet::default(),
             blockhash: Hash::default(),
             fee_calculator: FeeCalculator::default(),
+            return_data: (Pubkey::default(), Vec::new()),
         };
+        let number_of_program_accounts = keyed_accounts
+            .iter()
+            .position(|keyed_account| keyed_account.unsigned_key() == program_id)
+            .unwrap_or(0)
+            .saturating_add(1);
         invoke_context
             .invoke_stack
             .push(InvokeContextStackFrame::new(
-                Pubkey::default(),
+                number_of_program_accounts,
                 keyed_accounts,
             ));
         invoke_context
@@ -440,15 +408,14 @@ pub fn mock_set_sysvar<T: Sysvar>(
 impl<'a> InvokeContext for MockInvokeContext<'a> {
     fn push(
         &mut self,
-        key: &Pubkey,
-        keyed_accounts: &[(bool, bool, &Pubkey, &RefCell<AccountSharedData>)],
+        _message: &Message,
+        _instruction: &CompiledInstruction,
+        _program_indices: &[usize],
+        _account_indices: Option<&[usize]>,
     ) -> Result<(), InstructionError> {
-        fn transmute_lifetime<'a, 'b>(value: Vec<KeyedAccount<'a>>) -> Vec<KeyedAccount<'b>> {
-            unsafe { std::mem::transmute(value) }
-        }
         self.invoke_stack.push(InvokeContextStackFrame::new(
-            *key,
-            transmute_lifetime(create_keyed_accounts_unified(keyed_accounts)),
+            0,
+            create_keyed_accounts_unified(&[]),
         ));
         Ok(())
     }
@@ -458,10 +425,18 @@ impl<'a> InvokeContext for MockInvokeContext<'a> {
     fn invoke_depth(&self) -> usize {
         self.invoke_stack.len()
     }
+    fn verify(
+        &mut self,
+        _message: &Message,
+        _instruction: &CompiledInstruction,
+        _program_indices: &[usize],
+    ) -> Result<(), InstructionError> {
+        Ok(())
+    }
     fn verify_and_update(
         &mut self,
         _instruction: &CompiledInstruction,
-        _accounts: &[(Pubkey, Rc<RefCell<AccountSharedData>>)],
+        _account_indices: &[usize],
         _write_pivileges: &[bool],
     ) -> Result<(), InstructionError> {
         Ok(())
@@ -469,16 +444,18 @@ impl<'a> InvokeContext for MockInvokeContext<'a> {
     fn get_caller(&self) -> Result<&Pubkey, InstructionError> {
         self.invoke_stack
             .last()
-            .map(|frame| &frame.key)
+            .and_then(|frame| frame.program_id())
             .ok_or(InstructionError::CallDepth)
     }
     fn remove_first_keyed_account(&mut self) -> Result<(), InstructionError> {
-        let stack_frame = &mut self
-            .invoke_stack
-            .last_mut()
-            .ok_or(InstructionError::CallDepth)?;
-        stack_frame.keyed_accounts_range.start =
-            stack_frame.keyed_accounts_range.start.saturating_add(1);
+        if !self.is_feature_active(&remove_native_loader::id()) {
+            let stack_frame = &mut self
+                .invoke_stack
+                .last_mut()
+                .ok_or(InstructionError::CallDepth)?;
+            stack_frame.keyed_accounts_range.start =
+                stack_frame.keyed_accounts_range.start.saturating_add(1);
+        }
         Ok(())
     }
     fn get_keyed_accounts(&self) -> Result<&[KeyedAccount], InstructionError> {
@@ -493,11 +470,6 @@ impl<'a> InvokeContext for MockInvokeContext<'a> {
     fn get_logger(&self) -> Rc<RefCell<dyn Logger>> {
         Rc::new(RefCell::new(self.logger.clone()))
     }
-    #[allow(deprecated)]
-    fn get_bpf_compute_budget(&self) -> &BpfComputeBudget {
-        #[allow(deprecated)]
-        &self.bpf_compute_budget
-    }
     fn get_compute_meter(&self) -> Rc<RefCell<dyn ComputeMeter>> {
         Rc::new(RefCell::new(self.compute_meter.clone()))
     }
@@ -505,14 +477,15 @@ impl<'a> InvokeContext for MockInvokeContext<'a> {
     fn get_executor(&self, _pubkey: &Pubkey) -> Option<Arc<dyn Executor>> {
         None
     }
+    fn set_instruction_index(&mut self, _instruction_index: usize) {}
     fn record_instruction(&self, _instruction: &Instruction) {}
     fn is_feature_active(&self, feature_id: &Pubkey) -> bool {
         !self.disabled_features.contains(feature_id)
     }
-    fn get_account(&self, pubkey: &Pubkey) -> Option<Rc<RefCell<AccountSharedData>>> {
-        for (key, account) in self.accounts.iter() {
+    fn get_account(&self, pubkey: &Pubkey) -> Option<(usize, Rc<RefCell<AccountSharedData>>)> {
+        for (index, (key, account)) in self.accounts.iter().enumerate().rev() {
             if key == pubkey {
-                return Some(account.clone());
+                return Some((index, account.clone()));
             }
         }
         None
@@ -538,5 +511,12 @@ impl<'a> InvokeContext for MockInvokeContext<'a> {
     }
     fn get_fee_calculator(&self) -> &FeeCalculator {
         &self.fee_calculator
+    }
+    fn set_return_data(&mut self, data: Vec<u8>) -> Result<(), InstructionError> {
+        self.return_data = (*self.get_caller()?, data);
+        Ok(())
+    }
+    fn get_return_data(&self) -> (Pubkey, &[u8]) {
+        (self.return_data.0, &self.return_data.1)
     }
 }

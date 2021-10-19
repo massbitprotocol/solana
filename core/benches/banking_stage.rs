@@ -8,8 +8,6 @@ use log::*;
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
 use solana_core::banking_stage::{BankingStage, BankingStageStats};
-use solana_core::cost_model::CostModel;
-use solana_core::cost_tracker::CostTracker;
 use solana_entry::entry::{next_hash, Entry};
 use solana_gossip::cluster_info::ClusterInfo;
 use solana_gossip::cluster_info::Node;
@@ -20,6 +18,9 @@ use solana_perf::packet::to_packets_chunked;
 use solana_perf::test_tx::test_tx;
 use solana_poh::poh_recorder::{create_test_recorder, WorkingBankEntry};
 use solana_runtime::bank::Bank;
+use solana_runtime::cost_model::CostModel;
+use solana_runtime::cost_tracker::CostTracker;
+use solana_runtime::cost_tracker_stats::CostTrackerStats;
 use solana_sdk::genesis_config::GenesisConfig;
 use solana_sdk::hash::Hash;
 use solana_sdk::message::Message;
@@ -97,6 +98,7 @@ fn bench_consume_buffered(bencher: &mut Bencher) {
                 &Arc::new(RwLock::new(CostTracker::new(Arc::new(RwLock::new(
                     CostModel::new(std::u64::MAX, std::u64::MAX),
                 ))))),
+                &mut CostTrackerStats::default(),
             );
         });
 
@@ -113,7 +115,7 @@ fn make_accounts_txs(txes: usize, mint_keypair: &Keypair, hash: Hash) -> Vec<Tra
         .into_par_iter()
         .map(|_| {
             let mut new = dummy.clone();
-            let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen()).collect();
+            let sig: Vec<_> = (0..64).map(|_| thread_rng().gen::<u8>()).collect();
             new.message.account_keys[0] = pubkey::new_rand();
             new.message.account_keys[1] = pubkey::new_rand();
             new.signatures = vec![Signature::new(&sig[0..64])];
@@ -163,6 +165,7 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
     genesis_config.ticks_per_slot = 10_000;
 
     let (verified_sender, verified_receiver) = unbounded();
+    let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
     let (vote_sender, vote_receiver) = unbounded();
     let mut bank = Bank::new_for_benches(&genesis_config);
     // Allow arbitrary transaction processing time for the purposes of this bench
@@ -218,6 +221,7 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
             &cluster_info,
             &poh_recorder,
             verified_receiver,
+            tpu_vote_receiver,
             vote_receiver,
             None,
             s,
@@ -267,6 +271,7 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
             start += chunk_len;
             start %= verified.len();
         });
+        drop(tpu_vote_sender);
         drop(vote_sender);
         exit.store(true, Ordering::Relaxed);
         poh_service.join().unwrap();

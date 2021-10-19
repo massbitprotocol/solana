@@ -83,10 +83,6 @@ pub mod check_init_vote_data {
     solana_sdk::declare_id!("3ccR6QpxGYsAbWyfevEtBNGfWV4xBffxRj2tD6A9i39F");
 }
 
-pub mod enforce_aligned_host_addrs {
-    solana_sdk::declare_id!("6Qob9Z4RwGdf599FDVCqsjuKjR8ZFR3oVs2ByRLWBsua");
-}
-
 pub mod stake_program_v4 {
     solana_sdk::declare_id!("Dc7djyhP9aLfdq2zktpvskeAjpG56msCU1yexpxXiWZb");
 }
@@ -121,10 +117,6 @@ pub mod verify_tx_signatures_len {
 
 pub mod vote_stake_checked_instructions {
     solana_sdk::declare_id!("BcWknVcgvonN8sL4HE4XFuEVgfcee5MwxWPAgP6ZV89X");
-}
-
-pub mod updated_verify_policy {
-    solana_sdk::declare_id!("k15tVxtkgsmo7dy6iJ56N5hBCxuQAtqRgYwoTDuwbia");
 }
 
 pub mod neon_evm_compute_budget {
@@ -207,6 +199,52 @@ pub mod check_seed_length {
     solana_sdk::declare_id!("8HYXgkoKGreAMA3MfJkdjbKNVbfZRQP3jqFpa7iqN4v7");
 }
 
+pub mod return_data_syscall_enabled {
+    solana_sdk::declare_id!("BJVXq6NdLC7jCDGjfqJv7M1XHD4Y13VrpDqRF2U7UBcC");
+}
+
+pub mod fix_write_privs {
+    solana_sdk::declare_id!("7Tr5C1tdcCeBVD8jxtHYnvjL1DGdFboYBHCJkEFdenBb");
+}
+
+pub mod reduce_required_deploy_balance {
+    solana_sdk::declare_id!("EBeznQDjcPG8491sFsKZYBi5S5jTVXMpAKNDJMQPS2kq");
+}
+
+pub mod sol_log_data_syscall_enabled {
+    solana_sdk::declare_id!("HYPs7jyJ3KwQFdDpuSzMtVKf1MLJDaZRv3CSWvfUqdFo");
+}
+
+pub mod stakes_remove_delegation_if_inactive {
+    solana_sdk::declare_id!("HFpdDDNQjvcXnXKec697HDDsyk6tFoWS2o8fkxuhQZpL");
+}
+
+pub mod do_support_realloc {
+    solana_sdk::declare_id!("75m6ysz33AfLA5DDEzWM1obBrnPQRSsdVQ2nRmc8Vuu1");
+}
+
+// Note: when this feature is cleaned up, also remove the secp256k1 program from
+// the list of builtins and remove its files from /programs
+pub mod prevent_calling_precompiles_as_programs {
+    solana_sdk::declare_id!("4ApgRX3ud6p7LNMJmsuaAcZY5HWctGPr5obAsjB3A54d");
+}
+
+pub mod optimize_epoch_boundary_updates {
+    solana_sdk::declare_id!("265hPS8k8xJ37ot82KEgjRunsUp5w4n4Q4VwwiN9i9ps");
+}
+
+pub mod remove_native_loader {
+    solana_sdk::declare_id!("HTTgmruMYRZEntyL3EdCDdnS6e4D5wRq1FA7kQsb66qq");
+}
+
+pub mod send_to_tpu_vote_port {
+    solana_sdk::declare_id!("C5fh68nJ7uyKAuYZg2x9sEQ5YrVf3dkW6oojNBSc3Jvo");
+}
+
+pub mod turbine_peers_shuffle {
+    solana_sdk::declare_id!("4VvpgRD6UsHvkXwpuQhtR5NG1G4esMaExeWuSEpsYRUa");
+}
+
 lazy_static! {
     /// Map of feature identifiers to user-visible description
     pub static ref FEATURE_NAMES: HashMap<Pubkey, &'static str> = [
@@ -223,7 +261,6 @@ lazy_static! {
         (full_inflation::mainnet::certusone::vote::id(), "community vote allowing Certus One to enable full inflation"),
         (warp_timestamp_again::id(), "warp timestamp again, adjust bounding to 25% fast 80% slow #15204"),
         (check_init_vote_data::id(), "check initialized Vote data"),
-        (enforce_aligned_host_addrs::id(), "enforce aligned host addresses"),
         (stake_program_v4::id(), "solana_stake_program v4"),
         (secp256k1_recover_syscall_enabled::id(), "secp256k1_recover syscall"),
         (add_missing_program_error_mappings::id(), "add missing program error mappings"),
@@ -233,7 +270,6 @@ lazy_static! {
         (deterministic_shred_seed_enabled::id(), "deterministic shred seed"),
         (verify_tx_signatures_len::id(), "prohibit extra transaction signatures"),
         (vote_stake_checked_instructions::id(), "vote/state program checked instructions #18345"),
-        (updated_verify_policy::id(), "update verify policy"),
         (neon_evm_compute_budget::id(), "bump neon_evm's compute budget"),
         (rent_for_sysvars::id(), "collect rent from accounts owned by sysvars"),
         (libsecp256k1_0_5_upgrade_enabled::id(), "upgrade libsecp256k1 to v0.5.0"),
@@ -250,10 +286,21 @@ lazy_static! {
         (instructions_sysvar_owned_by_sysvar::id(), "fix owner for instructions sysvar"),
         (close_upgradeable_program_accounts::id(), "enable closing upgradeable program accounts"),
         (stake_program_advance_activating_credits_observed::id(), "Enable advancing credits observed for activation epoch #19309"),
-        (demote_program_write_locks::id(), "demote program write locks to readonly #19593"),
+        (demote_program_write_locks::id(), "demote program write locks to readonly, except when upgradeable loader present #19593 #20265"),
         (ed25519_program_enabled::id(), "enable builtin ed25519 signature verify program"),
         (allow_native_ids::id(), "allow native program ids in program derived addresses"),
         (check_seed_length::id(), "Check program address seed lengths"),
+        (return_data_syscall_enabled::id(), "enable sol_{set,get}_return_data syscall"),
+        (fix_write_privs::id(), "fix native invoke write privileges"),
+        (reduce_required_deploy_balance::id(), "reduce required payer balance for program deploys"),
+        (sol_log_data_syscall_enabled::id(), "enable sol_log_data syscall"),
+        (stakes_remove_delegation_if_inactive::id(), "remove delegations from stakes cache when inactive"),
+        (do_support_realloc::id(), "support account data reallocation"),
+        (prevent_calling_precompiles_as_programs::id(), "Prevent calling precompiles as programs"),
+        (optimize_epoch_boundary_updates::id(), "Optimize epoch boundary updates"),
+        (remove_native_loader::id(), "Remove support for the native loader"),
+        (send_to_tpu_vote_port::id(), "Send votes to the tpu vote port"),
+        (turbine_peers_shuffle::id(), "turbine peers shuffle patch"),
         /*************** ADD NEW FEATURES HERE ***************/
     ]
     .iter()

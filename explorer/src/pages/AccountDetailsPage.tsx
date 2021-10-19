@@ -6,6 +6,7 @@ import {
   useAccountInfo,
   Account,
   ProgramData,
+  TokenProgramData,
 } from "providers/accounts";
 import { StakeAccountSection } from "components/account/StakeAccountSection";
 import { TokenAccountSection } from "components/account/TokenAccountSection";
@@ -34,6 +35,8 @@ import { TransactionHistoryCard } from "components/account/history/TransactionHi
 import { TokenTransfersCard } from "components/account/history/TokenTransfersCard";
 import { TokenInstructionsCard } from "components/account/history/TokenInstructionsCard";
 import { RewardsCard } from "components/account/RewardsCard";
+import { MetaplexMetadataCard } from "components/account/MetaplexMetadataCard";
+import { NFTHeader } from "components/account/MetaplexNFTHeader";
 
 const IDENTICON_WIDTH = 64;
 
@@ -53,6 +56,13 @@ const TABS_LOOKUP: { [id: string]: Tab[] } = {
       slug: "largest",
       title: "Distribution",
       path: "/largest",
+    },
+  ],
+  "spl-token:mint:metaplexNFT": [
+    {
+      slug: "metadata",
+      title: "Metadata",
+      path: "/metadata",
     },
   ],
   stake: [
@@ -151,6 +161,11 @@ export function AccountHeader({
   const account = info?.data;
   const data = account?.details?.data;
   const isToken = data?.program === "spl-token" && data?.parsed.type === "mint";
+  const isNFT = isToken && data.nftData;
+
+  if (isNFT) {
+    return <NFTHeader nftData={data.nftData!} address={address} />;
+  }
 
   if (tokenDetails || isToken) {
     return (
@@ -294,7 +309,8 @@ export type MoreTabs =
   | "blockhashes"
   | "transfers"
   | "instructions"
-  | "rewards";
+  | "rewards"
+  | "metadata";
 
 function MoreSection({
   account,
@@ -358,6 +374,11 @@ function MoreSection({
         data.parsed.type === "recentBlockhashes" && (
           <BlockhashesCard blockhashes={data.parsed.info} />
         )}
+      {tab === "metadata" && (
+        <MetaplexMetadataCard
+          nftData={(account.details?.data as TokenProgramData).nftData!}
+        />
+      )}
     </>
   );
 }
@@ -382,6 +403,15 @@ function getTabs(data?: ProgramData): Tab[] {
 
   if (data && programTypeKey in TABS_LOOKUP) {
     tabs.push(...TABS_LOOKUP[programTypeKey]);
+  }
+
+  // Add the key for Metaplex NFTs
+  if (
+    data &&
+    programTypeKey === "spl-token:mint" &&
+    (data as TokenProgramData).nftData
+  ) {
+    tabs.push(...TABS_LOOKUP[`${programTypeKey}:metaplexNFT`]);
   }
 
   if (

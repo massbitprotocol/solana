@@ -1,5 +1,6 @@
 //! The `validator` module hosts all the validator microservices.
 
+pub use solana_perf::report_target_features;
 use {
     crate::{
         broadcast_stage::BroadcastStageType,
@@ -7,19 +8,20 @@ use {
         cluster_info_vote_listener::VoteTracker,
         completed_data_sets_service::CompletedDataSetsService,
         consensus::{reconcile_blockstore_roots_with_tower, Tower},
-        cost_model::CostModel,
         rewards_recorder_service::{RewardsRecorderSender, RewardsRecorderService},
         sample_performance_service::SamplePerformanceService,
         serve_repair::ServeRepair,
         serve_repair_service::ServeRepairService,
         sigverify,
         snapshot_packager_service::SnapshotPackagerService,
+        system_monitor_service::{verify_udp_stats_access, SystemMonitorService},
         tower_storage::TowerStorage,
         tpu::{Tpu, DEFAULT_TPU_COALESCE_MS},
         tvu::{Sockets, Tvu, TvuConfig},
     },
     crossbeam_channel::{bounded, unbounded},
     rand::{thread_rng, Rng},
+    solana_accountsdb_plugin_manager::accountsdb_plugin_service::AccountsDbPluginService,
     solana_entry::poh::compute_hash_time_ns,
     solana_gossip::{
         cluster_info::{
@@ -63,12 +65,15 @@ use {
     solana_runtime::{
         accounts_db::{AccountShrinkThreshold, AccountsDbConfig},
         accounts_index::AccountSecondaryIndexes,
+        accounts_update_notifier_interface::AccountsUpdateNotifier,
         bank::Bank,
         bank_forks::BankForks,
         commitment::BlockCommitmentCache,
+        cost_model::CostModel,
         hardened_unpack::{open_genesis_config, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE},
         snapshot_archive_info::SnapshotArchiveInfoGetter,
         snapshot_config::SnapshotConfig,
+        snapshot_hash::StartingSnapshotHashes,
         snapshot_package::{AccountsPackageSender, PendingSnapshotPackage},
         snapshot_utils,
     },
@@ -101,7 +106,7 @@ use {
 };
 
 const MAX_COMPLETED_DATA_SETS_IN_CHANNEL: usize = 100_000;
-const WAIT_FOR_SUPERMAJORITY_THRESHOLD_PERCENT: u64 = 90;
+const WAIT_FOR_SUPERMAJORITY_THRESHOLD_PERCENT: u64 = 80;
 
 pub struct ValidatorConfig {
     pub dev_halt_at_slot: Option<Slot>,
@@ -113,6 +118,7 @@ pub struct ValidatorConfig {
     pub account_shrink_paths: Option<Vec<PathBuf>>,
     pub rpc_config: JsonRpcConfig,
     pub accountsdb_repl_service_config: Option<AccountsDbReplServiceConfig>,
+    pub accountsdb_plugin_config_files: Option<Vec<PathBuf>>,
     pub rpc_addrs: Option<(SocketAddr, SocketAddr)>, // (JsonRpc, JsonRpcPubSub)
     pub pubsub_config: PubSubConfig,
     pub snapshot_config: Option<SnapshotConfig>,
@@ -158,6 +164,7 @@ pub struct ValidatorConfig {
     pub validator_exit: Arc<RwLock<Exit>>,
     pub no_wait_for_vote_to_start_leader: bool,
     pub accounts_shrink_ratio: AccountShrinkThreshold,
+    pub disable_epoch_boundary_optimization: bool,
 }
 
 impl Default for ValidatorConfig {
@@ -173,6 +180,7 @@ impl Default for ValidatorConfig {
             account_shrink_paths: None,
             rpc_config: JsonRpcConfig::default(),
             accountsdb_repl_service_config: None,
+            accountsdb_plugin_config_files: None,
             rpc_addrs: None,
             pubsub_config: PubSubConfig::default(),
             snapshot_config: None,
@@ -217,6 +225,7 @@ impl Default for ValidatorConfig {
             no_wait_for_vote_to_start_leader: true,
             accounts_shrink_ratio: AccountShrinkThreshold::default(),
             accounts_db_config: None,
+            disable_epoch_boundary_optimization: false,
         }
     }
 }
@@ -267,6 +276,7 @@ pub struct Validator {
     transaction_status_service: Option<TransactionStatusService>,
     rewards_recorder_service: Option<RewardsRecorderService>,
     cache_block_meta_service: Option<CacheBlockMetaService>,
+    system_monitor_service: Option<SystemMonitorService>,
     sample_performance_service: Option<SamplePerformanceService>,
     gossip_service: GossipService,
     serve_repair_service: ServeRepairService,
@@ -279,6 +289,7 @@ pub struct Validator {
     ip_echo_server: Option<solana_net_utils::IpEchoServer>,
     pub cluster_info: Arc<ClusterInfo>,
     accountsdb_repl_service: Option<AccountsDbReplService>,
+    accountsdb_plugin_service: Option<AccountsDbPluginService>,
 }
 
 // in the distant future, get rid of ::new()/exit() and use Result properly...
@@ -314,6 +325,27 @@ impl Validator {
 
         warn!("identity: {}", id);
         warn!("vote account: {}", vote_account);
+
+        let mut bank_notification_senders = Vec::new();
+
+        let accountsdb_plugin_service =
+            if let Some(accountsdb_plugin_config_files) = &config.accountsdb_plugin_config_files {
+                let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
+                bank_notification_senders.push(confirmed_bank_sender);
+                let result = AccountsDbPluginService::new(
+                    confirmed_bank_receiver,
+                    accountsdb_plugin_config_files,
+                );
+                match result {
+                    Ok(accountsdb_plugin_service) => Some(accountsdb_plugin_service),
+                    Err(err) => {
+                        error!("Failed to load the AccountsDb plugin: {:?}", err);
+                        abort();
+                    }
+                }
+            } else {
+                None
+            };
 
         if config.voting_disabled {
             warn!("voting disabled");
@@ -380,6 +412,7 @@ impl Validator {
         }
 
         let accounts_package_channel = channel();
+
         let (
             genesis_config,
             bank_forks,
@@ -388,7 +421,7 @@ impl Validator {
             completed_slots_receiver,
             leader_schedule_cache,
             last_full_snapshot_slot,
-            snapshot_hash,
+            starting_snapshot_hashes,
             TransactionHistoryServices {
                 transaction_status_sender,
                 transaction_status_service,
@@ -410,9 +443,18 @@ impl Validator {
             &start_progress,
             config.no_poh_speed_test,
             accounts_package_channel.0.clone(),
+            accountsdb_plugin_service
+                .as_ref()
+                .map(|plugin_service| plugin_service.get_accounts_update_notifier()),
         );
 
         *start_progress.write().unwrap() = ValidatorStartProgress::StartingServices;
+
+        verify_udp_stats_access().unwrap_or_else(|err| {
+            error!("Failed to access UDP stats: {}", err);
+            abort();
+        });
+        let system_monitor_service = Some(SystemMonitorService::new(Arc::clone(&exit)));
 
         let leader_schedule_cache = Arc::new(leader_schedule_cache);
         let bank = bank_forks.working_bank();
@@ -471,12 +513,12 @@ impl Validator {
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
 
-        let rpc_subscriptions = Arc::new(RpcSubscriptions::new_with_vote_subscription(
+        let rpc_subscriptions = Arc::new(RpcSubscriptions::new_with_config(
             &exit,
             bank_forks.clone(),
             block_commitment_cache.clone(),
             optimistically_confirmed_bank.clone(),
-            config.pubsub_config.enable_vote_subscription,
+            &config.pubsub_config,
         ));
 
         let max_slots = Arc::new(MaxSlots::default());
@@ -504,7 +546,7 @@ impl Validator {
             PohRecorder::new_with_clear_signal(
                 bank.tick_height(),
                 bank.last_blockhash(),
-                bank.slot(),
+                bank.clone(),
                 leader_schedule_cache.next_leader_slot(
                     &id,
                     bank.slot(),
@@ -545,13 +587,19 @@ impl Validator {
                 ));
             }
 
-            let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
-
             let accountsdb_repl_service = config.accountsdb_repl_service_config.as_ref().map(|accountsdb_repl_service_config| {
+                let (bank_notification_sender, bank_notification_receiver) = unbounded();
+                bank_notification_senders.push(bank_notification_sender);
                 accountsdb_repl_server_factory::AccountsDbReplServerFactory::build_accountsdb_repl_server(
-                    accountsdb_repl_service_config.clone(), confirmed_bank_receiver, bank_forks.clone())});
+                    accountsdb_repl_service_config.clone(), bank_notification_receiver, bank_forks.clone())
+            });
 
             let (bank_notification_sender, bank_notification_receiver) = unbounded();
+            let confirmed_bank_subscribers = if !bank_notification_senders.is_empty() {
+                Some(Arc::new(RwLock::new(bank_notification_senders)))
+            } else {
+                None
+            };
             (
                 Some(JsonRpcService::new(
                     rpc_addr,
@@ -577,12 +625,18 @@ impl Validator {
                 if config.rpc_config.minimal_api {
                     None
                 } else {
-                    Some(PubSubService::new(
+                    let (trigger, pubsub_service) = PubSubService::new(
                         config.pubsub_config.clone(),
                         &rpc_subscriptions,
                         rpc_pubsub_addr,
-                        &exit,
-                    ))
+                    );
+                    config
+                        .validator_exit
+                        .write()
+                        .unwrap()
+                        .register_exit(Box::new(move || trigger.cancel()));
+
+                    Some(pubsub_service)
                 },
                 Some(OptimisticallyConfirmedBankTracker::new(
                     bank_notification_receiver,
@@ -590,7 +644,7 @@ impl Validator {
                     bank_forks.clone(),
                     optimistically_confirmed_bank,
                     rpc_subscriptions.clone(),
-                    Some(Arc::new(RwLock::new(vec![confirmed_bank_sender]))),
+                    confirmed_bank_subscribers,
                 )),
                 Some(bank_notification_sender),
                 accountsdb_repl_service,
@@ -640,6 +694,7 @@ impl Validator {
             if let Some(snapshot_config) = config.snapshot_config.clone() {
                 if !is_snapshot_config_valid(
                     snapshot_config.full_snapshot_archive_interval_slots,
+                    snapshot_config.incremental_snapshot_archive_interval_slots,
                     config.accounts_hash_interval_slots,
                 ) {
                     error!("Snapshot config is invalid");
@@ -650,7 +705,7 @@ impl Validator {
 
                 let snapshot_packager_service = SnapshotPackagerService::new(
                     pending_snapshot_package.clone(),
-                    snapshot_hash,
+                    starting_snapshot_hashes,
                     &exit,
                     &cluster_info,
                     snapshot_config.clone(),
@@ -777,6 +832,7 @@ impl Validator {
                 rocksdb_max_compaction_jitter: config.rocksdb_compaction_interval,
                 wait_for_vote_to_start_leader,
                 accounts_shrink_ratio: config.accounts_shrink_ratio,
+                disable_epoch_boundary_optimization: config.disable_epoch_boundary_optimization,
             },
             &max_slots,
             &cost_model,
@@ -791,6 +847,7 @@ impl Validator {
             retransmit_slots_receiver,
             node.sockets.tpu,
             node.sockets.tpu_forwards,
+            node.sockets.tpu_vote,
             node.sockets.broadcast,
             &rpc_subscriptions,
             transaction_status_sender,
@@ -823,6 +880,7 @@ impl Validator {
             transaction_status_service,
             rewards_recorder_service,
             cache_block_meta_service,
+            system_monitor_service,
             sample_performance_service,
             snapshot_packager_service,
             completed_data_sets_service,
@@ -834,6 +892,7 @@ impl Validator {
             validator_exit: config.validator_exit.clone(),
             cluster_info,
             accountsdb_repl_service,
+            accountsdb_plugin_service,
         }
     }
 
@@ -916,6 +975,12 @@ impl Validator {
                 .expect("cache_block_meta_service");
         }
 
+        if let Some(system_monitor_service) = self.system_monitor_service {
+            system_monitor_service
+                .join()
+                .expect("system_monitor_service");
+        }
+
         if let Some(sample_performance_service) = self.sample_performance_service {
             sample_performance_service
                 .join()
@@ -943,6 +1008,12 @@ impl Validator {
             accountsdb_repl_service
                 .join()
                 .expect("accountsdb_repl_service");
+        }
+
+        if let Some(accountsdb_plugin_service) = self.accountsdb_plugin_service {
+            accountsdb_plugin_service
+                .join()
+                .expect("accountsdb_plugin_service");
         }
     }
 }
@@ -1086,6 +1157,7 @@ fn new_banks_from_ledger(
     start_progress: &Arc<RwLock<ValidatorStartProgress>>,
     no_poh_speed_test: bool,
     accounts_package_sender: AccountsPackageSender,
+    accounts_update_notifier: Option<AccountsUpdateNotifier>,
 ) -> (
     GenesisConfig,
     BankForks,
@@ -1094,7 +1166,7 @@ fn new_banks_from_ledger(
     CompletedSlotsReceiver,
     LeaderScheduleCache,
     Option<Slot>,
-    Option<(Slot, Hash)>,
+    Option<StartingSnapshotHashes>,
     TransactionHistoryServices,
     Tower,
 ) {
@@ -1189,26 +1261,31 @@ fn new_banks_from_ledger(
             TransactionHistoryServices::default()
         };
 
-    let (mut bank_forks, mut leader_schedule_cache, last_full_snapshot_slot, snapshot_hash) =
-        bank_forks_utils::load(
-            &genesis_config,
-            &blockstore,
-            config.account_paths.clone(),
-            config.account_shrink_paths.clone(),
-            config.snapshot_config.as_ref(),
-            process_options,
-            transaction_history_services
-                .transaction_status_sender
-                .as_ref(),
-            transaction_history_services
-                .cache_block_meta_sender
-                .as_ref(),
-            accounts_package_sender,
-        )
-        .unwrap_or_else(|err| {
-            error!("Failed to load ledger: {:?}", err);
-            abort()
-        });
+    let (
+        mut bank_forks,
+        mut leader_schedule_cache,
+        last_full_snapshot_slot,
+        starting_snapshot_hashes,
+    ) = bank_forks_utils::load(
+        &genesis_config,
+        &blockstore,
+        config.account_paths.clone(),
+        config.account_shrink_paths.clone(),
+        config.snapshot_config.as_ref(),
+        process_options,
+        transaction_history_services
+            .transaction_status_sender
+            .as_ref(),
+        transaction_history_services
+            .cache_block_meta_sender
+            .as_ref(),
+        accounts_package_sender,
+        accounts_update_notifier,
+    )
+    .unwrap_or_else(|err| {
+        error!("Failed to load ledger: {:?}", err);
+        abort()
+    });
 
     if let Some(warp_slot) = config.warp_slot {
         let snapshot_config = config.snapshot_config.as_ref().unwrap_or_else(|| {
@@ -1288,7 +1365,7 @@ fn new_banks_from_ledger(
         completed_slots_receiver,
         leader_schedule_cache,
         last_full_snapshot_slot,
-        snapshot_hash,
+        starting_snapshot_hashes,
         transaction_history_services,
         tower,
     )
@@ -1471,6 +1548,10 @@ fn wait_for_supermajority(
         let gossip_stake_percent = get_stake_percent_in_gossip(bank, cluster_info, i % 10 == 0);
 
         if gossip_stake_percent >= WAIT_FOR_SUPERMAJORITY_THRESHOLD_PERCENT {
+            info!(
+                "Supermajority reached, {}% active stake detected, starting up now.",
+                gossip_stake_percent,
+            );
             break;
         }
         // The normal RPC health checks don't apply as the node is waiting, so feign health to
@@ -1482,76 +1563,6 @@ fn wait_for_supermajority(
     rpc_override_health_check.store(false, Ordering::Relaxed);
     Ok(true)
 }
-
-fn is_rosetta_emulated() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        use std::str::FromStr;
-        std::process::Command::new("sysctl")
-            .args(&["-in", "sysctl.proc_translated"])
-            .output()
-            .map_err(|_| ())
-            .and_then(|output| String::from_utf8(output.stdout).map_err(|_| ()))
-            .and_then(|stdout| u8::from_str(stdout.trim()).map_err(|_| ()))
-            .map(|enabled| enabled == 1)
-            .unwrap_or(false)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
-}
-
-pub fn report_target_features() {
-    warn!(
-        "CUDA is {}abled",
-        if solana_perf::perf_libs::api().is_some() {
-            "en"
-        } else {
-            "dis"
-        }
-    );
-
-    if !is_rosetta_emulated() {
-        unsafe { check_avx() };
-        unsafe { check_avx2() };
-    }
-}
-
-// Validator binaries built on a machine with AVX support will generate invalid opcodes
-// when run on machines without AVX causing a non-obvious process abort.  Instead detect
-// the mismatch and error cleanly.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx")]
-unsafe fn check_avx() {
-    if is_x86_feature_detected!("avx") {
-        info!("AVX detected");
-    } else {
-        error!(
-            "Incompatible CPU detected: missing AVX support. Please build from source on the target"
-        );
-        abort();
-    }
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn check_avx() {}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-unsafe fn check_avx2() {
-    if is_x86_feature_detected!("avx2") {
-        info!("AVX2 detected");
-    } else {
-        error!(
-            "Incompatible CPU detected: missing AVX2 support. Please build from source on the target"
-        );
-        abort();
-    }
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-unsafe fn check_avx2() {}
 
 // Get the activated stake percentage (based on the provided bank) that is visible in gossip
 fn get_stake_percent_in_gossip(bank: &Bank, cluster_info: &ClusterInfo, log: bool) -> u64 {
@@ -1612,21 +1623,22 @@ fn get_stake_percent_in_gossip(bank: &Bank, cluster_info: &ClusterInfo, log: boo
         }
     }
 
+    let online_stake_percentage = (online_stake as f64 / total_activated_stake as f64) * 100.;
     if log {
         info!(
-            "{}% of active stake visible in gossip",
-            online_stake * 100 / total_activated_stake
+            "{:.3}% of active stake visible in gossip",
+            online_stake_percentage
         );
 
         if !wrong_shred_nodes.is_empty() {
             info!(
-                "{}% of active stake has the wrong shred version in gossip",
-                wrong_shred_stake * 100 / total_activated_stake,
+                "{:.3}% of active stake has the wrong shred version in gossip",
+                (wrong_shred_stake as f64 / total_activated_stake as f64) * 100.,
             );
             for (stake, identity) in wrong_shred_nodes {
                 info!(
-                    "    {}% - {}",
-                    stake * 100 / total_activated_stake,
+                    "    {:.3}% - {}",
+                    (stake as f64 / total_activated_stake as f64) * 100.,
                     identity
                 );
             }
@@ -1634,20 +1646,20 @@ fn get_stake_percent_in_gossip(bank: &Bank, cluster_info: &ClusterInfo, log: boo
 
         if !offline_nodes.is_empty() {
             info!(
-                "{}% of active stake is not visible in gossip",
-                offline_stake * 100 / total_activated_stake
+                "{:.3}% of active stake is not visible in gossip",
+                (offline_stake as f64 / total_activated_stake as f64) * 100.
             );
             for (stake, identity) in offline_nodes {
                 info!(
-                    "    {}% - {}",
-                    stake * 100 / total_activated_stake,
+                    "    {:.3}% - {}",
+                    (stake as f64 / total_activated_stake as f64) * 100.,
                     identity
                 );
             }
         }
     }
 
-    online_stake * 100 / total_activated_stake
+    online_stake_percentage as u64
 }
 
 // Cleanup anything that looks like an accounts append-vec
@@ -1661,12 +1673,26 @@ fn cleanup_accounts_path(account_path: &std::path::Path) {
 }
 
 pub fn is_snapshot_config_valid(
-    snapshot_interval_slots: u64,
-    accounts_hash_interval_slots: u64,
+    full_snapshot_interval_slots: Slot,
+    incremental_snapshot_interval_slots: Slot,
+    accounts_hash_interval_slots: Slot,
 ) -> bool {
-    snapshot_interval_slots == 0
-        || (snapshot_interval_slots >= accounts_hash_interval_slots
-            && snapshot_interval_slots % accounts_hash_interval_slots == 0)
+    // if full snapshot interval is MAX, that means snapshots are turned off, so yes, valid
+    if full_snapshot_interval_slots == Slot::MAX {
+        return true;
+    }
+
+    let is_incremental_config_valid = if incremental_snapshot_interval_slots == Slot::MAX {
+        true
+    } else {
+        incremental_snapshot_interval_slots >= accounts_hash_interval_slots
+            && incremental_snapshot_interval_slots % accounts_hash_interval_slots == 0
+            && full_snapshot_interval_slots > incremental_snapshot_interval_slots
+    };
+
+    full_snapshot_interval_slots >= accounts_hash_interval_slots
+        && full_snapshot_interval_slots % accounts_hash_interval_slots == 0
+        && is_incremental_config_valid
 }
 
 #[cfg(test)]
@@ -1871,11 +1897,40 @@ mod tests {
 
     #[test]
     fn test_interval_check() {
-        assert!(is_snapshot_config_valid(0, 100));
-        assert!(!is_snapshot_config_valid(1, 100));
-        assert!(!is_snapshot_config_valid(230, 100));
-        assert!(is_snapshot_config_valid(500, 100));
-        assert!(is_snapshot_config_valid(5, 5));
+        assert!(is_snapshot_config_valid(300, 200, 100));
+
+        let default_accounts_hash_interval =
+            snapshot_utils::DEFAULT_INCREMENTAL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS;
+        assert!(is_snapshot_config_valid(
+            snapshot_utils::DEFAULT_FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
+            snapshot_utils::DEFAULT_INCREMENTAL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
+            default_accounts_hash_interval,
+        ));
+
+        assert!(is_snapshot_config_valid(
+            Slot::MAX,
+            snapshot_utils::DEFAULT_INCREMENTAL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
+            default_accounts_hash_interval
+        ));
+        assert!(is_snapshot_config_valid(
+            snapshot_utils::DEFAULT_FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
+            Slot::MAX,
+            default_accounts_hash_interval
+        ));
+        assert!(is_snapshot_config_valid(
+            snapshot_utils::DEFAULT_INCREMENTAL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
+            Slot::MAX,
+            default_accounts_hash_interval
+        ));
+
+        assert!(!is_snapshot_config_valid(0, 100, 100));
+        assert!(!is_snapshot_config_valid(100, 0, 100));
+        assert!(!is_snapshot_config_valid(42, 100, 100));
+        assert!(!is_snapshot_config_valid(100, 42, 100));
+        assert!(!is_snapshot_config_valid(100, 100, 100));
+        assert!(!is_snapshot_config_valid(100, 200, 100));
+        assert!(!is_snapshot_config_valid(444, 200, 100));
+        assert!(!is_snapshot_config_valid(400, 222, 100));
     }
 
     #[test]

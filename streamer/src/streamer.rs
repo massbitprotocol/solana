@@ -6,7 +6,7 @@ use crate::{
     recvmmsg::NUM_RCVMMSGS,
     socket::SocketAddrSpace,
 };
-use solana_sdk::timing::{duration_as_ms, timestamp};
+use solana_sdk::timing::timestamp;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, Sender};
@@ -95,9 +95,7 @@ pub fn receiver(
     use_pinned_memory: bool,
 ) -> JoinHandle<()> {
     let res = sock.set_read_timeout(Some(Duration::new(1, 0)));
-    if res.is_err() {
-        panic!("streamer::receiver set_read_timeout error");
-    }
+    assert!(!res.is_err(), "streamer::receiver set_read_timeout error");
     let exit = exit.clone();
     Builder::new()
         .name("solana-receiver".to_string())
@@ -126,7 +124,7 @@ fn recv_send(
     Ok(())
 }
 
-pub fn recv_batch(recvr: &PacketReceiver, max_batch: usize) -> Result<(Vec<Packets>, usize, u64)> {
+pub fn recv_batch(recvr: &PacketReceiver) -> Result<(Vec<Packets>, usize, Duration)> {
     let timer = Duration::new(1, 0);
     let msgs = recvr.recv_timeout(timer)?;
     let recv_start = Instant::now();
@@ -137,12 +135,10 @@ pub fn recv_batch(recvr: &PacketReceiver, max_batch: usize) -> Result<(Vec<Packe
         trace!("got more msgs");
         len += more.packets.len();
         batch.push(more);
-        if len > max_batch {
-            break;
-        }
     }
+    let recv_duration = recv_start.elapsed();
     trace!("batch len {}", batch.len());
-    Ok((batch, len, duration_as_ms(&recv_start.elapsed())))
+    Ok((batch, len, recv_duration))
 }
 
 pub fn responder(

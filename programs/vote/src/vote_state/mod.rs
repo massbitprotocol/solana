@@ -235,7 +235,7 @@ impl VoteState {
 
     // utility function, used by Stakes, tests
     pub fn to<T: WritableAccount>(versioned: &VoteStateVersions, account: &mut T) -> Option<()> {
-        Self::serialize(versioned, &mut account.data_as_mut_slice()).ok()
+        Self::serialize(versioned, account.data_as_mut_slice()).ok()
     }
 
     pub fn deserialize(input: &[u8]) -> Result<Self, InstructionError> {
@@ -710,9 +710,8 @@ pub fn initialize_account<S: std::hash::BuildHasher>(
     vote_init: &VoteInit,
     signers: &HashSet<Pubkey, S>,
     clock: &Clock,
-    check_data_size: bool,
 ) -> Result<(), InstructionError> {
-    if check_data_size && vote_account.data_len()? != VoteState::size_of() {
+    if vote_account.data_len()? != VoteState::size_of() {
         return Err(InstructionError::InvalidAccountData);
     }
     let versioned = State::<VoteStateVersions>::state(vote_account)?;
@@ -842,7 +841,6 @@ mod tests {
             },
             &signers,
             &Clock::default(),
-            true,
         );
         assert_eq!(res, Err(InstructionError::MissingRequiredSignature));
 
@@ -860,7 +858,6 @@ mod tests {
             },
             &signers,
             &Clock::default(),
-            true,
         );
         assert_eq!(res, Ok(()));
 
@@ -875,7 +872,6 @@ mod tests {
             },
             &signers,
             &Clock::default(),
-            true,
         );
         assert_eq!(res, Err(InstructionError::AccountAlreadyInitialized));
 
@@ -893,7 +889,6 @@ mod tests {
             },
             &signers,
             &Clock::default(),
-            true,
         );
         assert_eq!(res, Err(InstructionError::InvalidAccountData));
     }

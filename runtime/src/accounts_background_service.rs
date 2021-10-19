@@ -109,7 +109,7 @@ impl SnapshotRequestHandler {
                 let previous_hash = if test_hash_calculation {
                     // We have to use the index version here.
                     // We cannot calculate the non-index way because cache has not been flushed and stores don't match reality.
-                    snapshot_root_bank.update_accounts_hash_with_index_option(true, false, None)
+                    snapshot_root_bank.update_accounts_hash_with_index_option(true, false, None, false)
                 } else {
                     Hash::default()
                 };
@@ -148,6 +148,7 @@ impl SnapshotRequestHandler {
                     use_index_hash_calculation,
                     test_hash_calculation,
                     Some(snapshot_root_bank.epoch_schedule().slots_per_epoch),
+                    false,
                 );
                 let hash_for_testing = if test_hash_calculation {
                     assert_eq!(previous_hash, this_hash);
@@ -217,6 +218,12 @@ impl SnapshotRequestHandler {
                     }
                 }
                 snapshot_time.stop();
+                info!("Took bank snapshot. snapshot type: {:?}, slot: {}, accounts hash: {}, bank hash: {}",
+                      snapshot_type,
+                      snapshot_root_bank.slot(),
+                      snapshot_root_bank.get_accounts_hash(),
+                      snapshot_root_bank.hash(),
+                  );
 
                 // Cleanup outdated snapshots
                 let mut purge_old_snapshots_time = Measure::start("purge_old_snapshots_time");

@@ -32,6 +32,7 @@ use {
         instruction::InstructionError,
         message::Message,
         native_token::sol_to_lamports,
+        poh_config::PohConfig,
         process_instruction::{stable_log, InvokeContext, ProcessInstructionWithContext},
         program_error::{ProgramError, ACCOUNT_BORROW_FAILED, UNSUPPORTED_SYSVAR},
         pubkey::Pubkey,
@@ -100,13 +101,18 @@ fn get_invoke_context<'a>() -> &'a mut dyn InvokeContext {
 
 pub fn builtin_process_instruction(
     process_instruction: solana_sdk::entrypoint::ProcessInstruction,
-    program_id: &Pubkey,
+    _first_instruction_account: usize,
     input: &[u8],
     invoke_context: &mut dyn InvokeContext,
 ) -> Result<(), InstructionError> {
     set_invoke_context(invoke_context);
 
-    let keyed_accounts = invoke_context.get_keyed_accounts()?;
+    let logger = invoke_context.get_logger();
+    let program_id = invoke_context.get_caller()?;
+    stable_log::program_invoke(&logger, program_id, invoke_context.invoke_depth());
+
+    // Skip the processor account
+    let keyed_accounts = &invoke_context.get_keyed_accounts()?[1..];
 
     // Copy all the accounts into a HashMap to ensure there are no duplicates
     let mut accounts: HashMap<Pubkey, Account> = keyed_accounts
@@ -154,7 +160,12 @@ pub fn builtin_process_instruction(
         .collect();
 
     // Execute the program
-    process_instruction(program_id, &account_infos, input).map_err(u64::from)?;
+    process_instruction(program_id, &account_infos, input).map_err(|err| {
+        let err = u64::from(err);
+        stable_log::program_failure(&logger, program_id, &err.into());
+        err
+    })?;
+    stable_log::program_success(&logger, program_id);
 
     // Commit AccountInfo changes back into KeyedAccounts
     for keyed_account in keyed_accounts {
@@ -174,12 +185,12 @@ pub fn builtin_process_instruction(
 macro_rules! processor {
     ($process_instruction:expr) => {
         Some(
-            |program_id: &Pubkey,
+            |first_instruction_account: usize,
              input: &[u8],
              invoke_context: &mut dyn solana_sdk::process_instruction::InvokeContext| {
                 $crate::builtin_process_instruction(
                     $process_instruction,
-                    program_id,
+                    first_instruction_account,
                     input,
                     invoke_context,
                 )
@@ -254,14 +265,6 @@ impl solana_sdk::program_stubs::SyscallStubs for SyscallStubs {
         let message = Message::new(&[instruction.clone()], None);
         let program_id_index = message.instructions[0].program_id_index as usize;
         let program_id = message.account_keys[program_id_index];
-        let program_account_info = || {
-            for account_info in account_infos {
-                if account_info.unsigned_key() == &program_id {
-                    return account_info;
-                }
-            }
-            panic!("Program id {} wasn't found in account_infos", program_id);
-        };
         let demote_program_write_locks =
             invoke_context.is_feature_active(&demote_program_write_locks::id());
         // TODO don't have the caller's keyed_accounts so can't validate writer or signer escalation or deescalation yet
@@ -274,36 +277,38 @@ impl solana_sdk::program_stubs::SyscallStubs for SyscallStubs {
 
         stable_log::program_invoke(&logger, &program_id, invoke_context.invoke_depth());
 
-        fn ai_to_a(ai: &AccountInfo) -> AccountSharedData {
-            AccountSharedData::from(Account {
-                lamports: ai.lamports(),
-                data: ai.try_borrow_data().unwrap().to_vec(),
-                owner: *ai.owner,
-                executable: ai.executable,
-                rent_epoch: ai.rent_epoch,
-            })
-        }
-        let executables = vec![(
-            program_id,
-            Rc::new(RefCell::new(ai_to_a(program_account_info()))),
-        )];
-
         // Convert AccountInfos into Accounts
-        let mut accounts = vec![];
-        'outer: for key in &message.account_keys {
-            for account_info in account_infos {
-                if account_info.unsigned_key() == key {
-                    accounts.push((*key, Rc::new(RefCell::new(ai_to_a(account_info)))));
-                    continue 'outer;
-                }
+        let mut account_indices = Vec::with_capacity(message.account_keys.len());
+        let mut accounts = Vec::with_capacity(message.account_keys.len());
+        for (i, account_key) in message.account_keys.iter().enumerate() {
+            let ((account_index, account), account_info) = invoke_context
+                .get_account(account_key)
+                .zip(
+                    account_infos
+                        .iter()
+                        .find(|account_info| account_info.unsigned_key() == account_key),
+                )
+                .ok_or(InstructionError::MissingAccount)
+                .unwrap();
+            {
+                let mut account = account.borrow_mut();
+                account.copy_into_owner_from_slice(account_info.owner.as_ref());
+                account.set_data_from_slice(&account_info.try_borrow_data().unwrap());
+                account.set_lamports(account_info.lamports());
+                account.set_executable(account_info.executable);
+                account.set_rent_epoch(account_info.rent_epoch);
             }
-            panic!("Account {} wasn't found in account_infos", key);
+            let account_info = if message.is_writable(i, demote_program_write_locks) {
+                Some(account_info)
+            } else {
+                None
+            };
+            account_indices.push(account_index);
+            accounts.push((account, account_info));
         }
-        assert_eq!(
-            accounts.len(),
-            message.account_keys.len(),
-            "Missing or not enough accounts passed to invoke"
-        );
+        let (program_account_index, _program_account) =
+            invoke_context.get_account(&program_id).unwrap();
+        let program_indices = vec![program_account_index];
 
         // Check Signers
         for account_info in account_infos {
@@ -320,9 +325,11 @@ impl solana_sdk::program_stubs::SyscallStubs for SyscallStubs {
                             break;
                         }
                     }
-                    if !program_signer {
-                        panic!("Missing signer for {}", instruction_account.pubkey);
-                    }
+                    assert!(
+                        program_signer,
+                        "Missing signer for {}",
+                        instruction_account.pubkey
+                    );
                 }
             }
         }
@@ -331,44 +338,37 @@ impl solana_sdk::program_stubs::SyscallStubs for SyscallStubs {
 
         InstructionProcessor::process_cross_program_instruction(
             &message,
-            &executables,
-            &accounts,
+            &program_indices,
+            &account_indices,
             &caller_privileges,
             invoke_context,
         )
         .map_err(|err| ProgramError::try_from(err).unwrap_or_else(|err| panic!("{}", err)))?;
 
         // Copy writeable account modifications back into the caller's AccountInfos
-        for (i, (pubkey, account)) in accounts.iter().enumerate().take(message.account_keys.len()) {
-            if !message.is_writable(i, demote_program_write_locks) {
-                continue;
-            }
-            for account_info in account_infos {
-                if account_info.unsigned_key() == pubkey {
-                    **account_info.try_borrow_mut_lamports().unwrap() = account.borrow().lamports();
-
-                    let mut data = account_info.try_borrow_mut_data()?;
-                    let account_borrow = account.borrow();
-                    let new_data = account_borrow.data();
-                    if account_info.owner != account.borrow().owner() {
-                        // TODO Figure out a better way to allow the System Program to set the account owner
-                        #[allow(clippy::transmute_ptr_to_ptr)]
-                        #[allow(mutable_transmutes)]
-                        let account_info_mut =
-                            unsafe { transmute::<&Pubkey, &mut Pubkey>(account_info.owner) };
-                        *account_info_mut = *account.borrow().owner();
-                    }
-                    if data.len() != new_data.len() {
-                        // TODO: Figure out how to allow the System Program to resize the account data
-                        panic!(
-                            "Account data resizing not supported yet: {} -> {}. \
-                            Consider making this test conditional on `#[cfg(feature = \"test-bpf\")]`",
-                            data.len(),
-                            new_data.len()
-                        );
-                    }
-                    data.clone_from_slice(new_data);
+        for (account, account_info) in accounts.iter() {
+            if let Some(account_info) = account_info {
+                **account_info.try_borrow_mut_lamports().unwrap() = account.borrow().lamports();
+                let mut data = account_info.try_borrow_mut_data()?;
+                let account_borrow = account.borrow();
+                let new_data = account_borrow.data();
+                if account_info.owner != account.borrow().owner() {
+                    // TODO Figure out a better way to allow the System Program to set the account owner
+                    #[allow(clippy::transmute_ptr_to_ptr)]
+                    #[allow(mutable_transmutes)]
+                    let account_info_mut =
+                        unsafe { transmute::<&Pubkey, &mut Pubkey>(account_info.owner) };
+                    *account_info_mut = *account.borrow().owner();
                 }
+                // TODO: Figure out how to allow the System Program to resize the account data
+                assert!(
+                    data.len() == new_data.len(),
+                    "Account data resizing not supported yet: {} -> {}. \
+                        Consider making this test conditional on `#[cfg(feature = \"test-bpf\")]`",
+                    data.len(),
+                    new_data.len()
+                );
+                data.clone_from_slice(new_data);
             }
         }
 
@@ -717,6 +717,20 @@ impl ProgramTest {
         }
     }
 
+    /// Add a builtin program to the test environment.
+    ///
+    /// Note that builtin programs are responsible for their own `stable_log` output.
+    pub fn add_builtin_program(
+        &mut self,
+        program_name: &str,
+        program_id: Pubkey,
+        process_instruction: ProcessInstructionWithContext,
+    ) {
+        info!("\"{}\" builtin program", program_name);
+        self.builtins
+            .push(Builtin::new(program_name, program_id, process_instruction));
+    }
+
     fn setup_bank(
         &self,
     ) -> (
@@ -743,7 +757,7 @@ impl ProgramTest {
         let mint_keypair = Keypair::new();
         let voting_keypair = Keypair::new();
 
-        let genesis_config = create_genesis_config_with_leader_ex(
+        let mut genesis_config = create_genesis_config_with_leader_ex(
             sol_to_lamports(1_000_000.0),
             &mint_keypair.pubkey(),
             &bootstrap_validator_pubkey,
@@ -756,6 +770,8 @@ impl ProgramTest {
             ClusterType::Development,
             vec![],
         );
+        let target_tick_duration = Duration::from_micros(100);
+        genesis_config.poh_config = PohConfig::new_sleep(target_tick_duration);
         debug!("Payer address: {}", mint_keypair.pubkey());
         debug!("Genesis config: {}", genesis_config);
 
@@ -764,7 +780,7 @@ impl ProgramTest {
         // Add loaders
         macro_rules! add_builtin {
             ($b:expr) => {
-                bank.add_builtin(&$b.0, $b.1, $b.2)
+                bank.add_builtin(&$b.0, &$b.1, $b.2)
             };
         }
         add_builtin!(solana_bpf_loader_deprecated_program!());
@@ -785,7 +801,7 @@ impl ProgramTest {
         for builtin in self.builtins.iter() {
             bank.add_builtin(
                 &builtin.name,
-                builtin.id,
+                &builtin.id,
                 builtin.process_instruction_with_context,
             );
         }
@@ -825,8 +841,13 @@ impl ProgramTest {
 
     pub async fn start(self) -> (BanksClient, Keypair, Hash) {
         let (bank_forks, block_commitment_cache, last_blockhash, gci) = self.setup_bank();
-        let transport =
-            start_local_server(bank_forks.clone(), block_commitment_cache.clone()).await;
+        let target_tick_duration = gci.genesis_config.poh_config.target_tick_duration;
+        let transport = start_local_server(
+            bank_forks.clone(),
+            block_commitment_cache.clone(),
+            target_tick_duration,
+        )
+        .await;
         let banks_client = start_client(transport)
             .await
             .unwrap_or_else(|err| panic!("Failed to start banks client: {}", err));
@@ -834,7 +855,6 @@ impl ProgramTest {
         // Run a simulated PohService to provide the client with new blockhashes.  New blockhashes
         // are required when sending multiple otherwise identical transactions in series from a
         // test
-        let target_tick_duration = gci.genesis_config.poh_config.target_tick_duration;
         tokio::spawn(async move {
             loop {
                 bank_forks
@@ -855,8 +875,13 @@ impl ProgramTest {
     /// with SOL for sending transactions
     pub async fn start_with_context(self) -> ProgramTestContext {
         let (bank_forks, block_commitment_cache, last_blockhash, gci) = self.setup_bank();
-        let transport =
-            start_local_server(bank_forks.clone(), block_commitment_cache.clone()).await;
+        let target_tick_duration = gci.genesis_config.poh_config.target_tick_duration;
+        let transport = start_local_server(
+            bank_forks.clone(),
+            block_commitment_cache.clone(),
+            target_tick_duration,
+        )
+        .await;
         let banks_client = start_client(transport)
             .await
             .unwrap_or_else(|err| panic!("Failed to start banks client: {}", err));
@@ -1025,7 +1050,7 @@ impl ProgramTestContext {
         bank_forks.set_root(
             pre_warp_slot,
             &solana_runtime::accounts_background_service::AbsRequestSender::default(),
-            Some(warp_slot),
+            Some(pre_warp_slot),
         );
 
         // warp bank is frozen, so go forward one slot from it
@@ -1038,7 +1063,11 @@ impl ProgramTestContext {
         // Update block commitment cache, otherwise banks server will poll at
         // the wrong slot
         let mut w_block_commitment_cache = self.block_commitment_cache.write().unwrap();
-        w_block_commitment_cache.set_all_slots(pre_warp_slot, warp_slot);
+        // HACK: The root set here should be `pre_warp_slot`, but since we're
+        // in a testing environment, the root bank never updates after a warp.
+        // The ticking thread only updates the working bank, and never the root
+        // bank.
+        w_block_commitment_cache.set_all_slots(warp_slot, warp_slot);
 
         let bank = bank_forks.working_bank();
         self.last_blockhash = bank.last_blockhash();

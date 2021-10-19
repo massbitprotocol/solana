@@ -8,7 +8,7 @@
 //! `Bank::process_transactions`
 //!
 //! It does this by loading the accounts using the reference it holds on the account store,
-//! and then passing those to the message_processor which handles loading the programs specified
+//! and then passing those to an InvokeContext which handles loading the programs specified
 //! by the Transaction and executing it.
 //!
 //! The bank then stores the results to the accounts store.
@@ -34,15 +34,13 @@
 //! on behalf of the caller, and a low-level API for when they have
 //! already been signed and verified.
 use crate::{
-    accounts::{
-        AccountAddressFilter, Accounts, TransactionAccounts, TransactionLoadResult,
-        TransactionLoaders,
-    },
+    accounts::{AccountAddressFilter, Accounts, TransactionAccounts, TransactionLoadResult},
     accounts_db::{
         AccountShrinkThreshold, AccountsDbConfig, ErrorCounters, SnapshotStorages,
         ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS, ACCOUNTS_DB_CONFIG_FOR_TESTING,
     },
     accounts_index::{AccountSecondaryIndexes, IndexKey, ScanResult},
+    accounts_update_notifier_interface::AccountsUpdateNotifier,
     ancestors::{Ancestors, AncestorsForSerialization},
     blockhash_queue::BlockhashQueue,
     builtins::{self, ActivationType, Builtin, Builtins},
@@ -63,12 +61,16 @@ use crate::{
     vote_account::VoteAccount,
 };
 use byteorder::{ByteOrder, LittleEndian};
+use dashmap::DashMap;
 use itertools::Itertools;
 use log::*;
-use rayon::ThreadPool;
+use rayon::{
+    iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
+    ThreadPool, ThreadPoolBuilder,
+};
 use solana_measure::measure::Measure;
 use solana_metrics::{datapoint_debug, inc_new_counter_debug, inc_new_counter_info};
-use solana_program_runtime::{ExecuteDetailsTimings, Executors};
+use solana_program_runtime::{ExecuteDetailsTimings, Executors, InstructionProcessor};
 #[allow(deprecated)]
 use solana_sdk::recent_blockhashes_account;
 use solana_sdk::{
@@ -100,13 +102,13 @@ use solana_sdk::{
     native_token::sol_to_lamports,
     nonce, nonce_account,
     packet::PACKET_DATA_SIZE,
+    precompiles::get_precompiles,
     process_instruction::{ComputeMeter, Executor, ProcessInstructionWithContext},
     program_utils::limited_deserialize,
     pubkey::Pubkey,
     signature::{Keypair, Signature},
     slot_hashes::SlotHashes,
     slot_history::SlotHistory,
-    stake::{self, state::Delegation},
     system_transaction,
     sysvar::{self},
     timing::years_as_slots,
@@ -114,7 +116,9 @@ use solana_sdk::{
         Result, SanitizedTransaction, Transaction, TransactionError, VersionedTransaction,
     },
 };
-use solana_stake_program::stake_state::{self, InflationPointCalculationEvent, PointValue};
+use solana_stake_program::stake_state::{
+    self, Delegation, InflationPointCalculationEvent, PointValue, StakeState,
+};
 use solana_vote_program::{
     vote_instruction::VoteInstruction,
     vote_state::{VoteState, VoteStateVersions},
@@ -192,7 +196,6 @@ type BankStatusCache = StatusCache<Result<()>>;
 #[frozen_abi(digest = "5Br3PNyyX1L7XoS4jYLt5JTeMXowLSsu7v9LhokC8vnq")]
 pub type BankSlotDelta = SlotDelta<Result<()>>;
 type TransactionAccountRefCells = Vec<(Pubkey, Rc<RefCell<AccountSharedData>>)>;
-type TransactionLoaderRefCells = Vec<Vec<(Pubkey, Rc<RefCell<AccountSharedData>>)>>;
 
 // Eager rent collection repeats in cyclic manner.
 // Each cycle is composed of <partition_count> number of tiny pubkey subranges
@@ -682,6 +685,7 @@ pub(crate) struct BankFieldsToDeserialize {
     pub(crate) ns_per_slot: u128,
     pub(crate) genesis_creation_time: UnixTimestamp,
     pub(crate) slots_per_year: f64,
+    #[allow(dead_code)]
     pub(crate) unused: u64,
     pub(crate) slot: Slot,
     pub(crate) epoch: Epoch,
@@ -791,7 +795,7 @@ pub enum RewardCalculationEvent<'a, 'b> {
     Staking(&'a Pubkey, &'b InflationPointCalculationEvent),
 }
 
-fn null_tracer() -> Option<impl FnMut(&RewardCalculationEvent)> {
+fn null_tracer() -> Option<impl Fn(&RewardCalculationEvent) + Send + Sync> {
     None::<fn(&RewardCalculationEvent)>
 }
 
@@ -949,8 +953,8 @@ pub struct Bank {
     /// stream for the slot == self.slot
     is_delta: AtomicBool,
 
-    /// The Message processor
-    message_processor: MessageProcessor,
+    /// The InstructionProcessor
+    instruction_processor: InstructionProcessor,
 
     compute_budget: Option<ComputeBudget>,
 
@@ -988,12 +992,26 @@ pub struct Bank {
     pub drop_callback: RwLock<OptionalDropCallback>,
 
     pub freeze_started: AtomicBool,
+
+    vote_only_bank: bool,
 }
 
 impl Default for BlockhashQueue {
     fn default() -> Self {
         Self::new(MAX_RECENT_BLOCKHASHES)
     }
+}
+
+struct VoteWithStakeDelegations {
+    vote_state: Arc<VoteState>,
+    vote_account: AccountSharedData,
+    delegations: Vec<(Pubkey, (StakeState, AccountSharedData))>,
+}
+
+#[derive(Debug, Default)]
+pub struct NewBankOptions {
+    pub vote_only_bank: bool,
+    pub disable_epoch_boundary_optimization: bool,
 }
 
 impl Bank {
@@ -1097,7 +1115,7 @@ impl Bank {
             stakes: RwLock::<Stakes>::default(),
             epoch_stakes: HashMap::<Epoch, EpochStakes>::default(),
             is_delta: AtomicBool::default(),
-            message_processor: MessageProcessor::default(),
+            instruction_processor: InstructionProcessor::default(),
             compute_budget: Option::<ComputeBudget>::default(),
             feature_builtins: Arc::<Vec<(Builtin, Pubkey, ActivationType)>>::default(),
             last_vote_sync: AtomicU64::default(),
@@ -1113,6 +1131,7 @@ impl Bank {
             feature_set: Arc::<FeatureSet>::default(),
             drop_callback: RwLock::<OptionalDropCallback>::default(),
             freeze_started: AtomicBool::default(),
+            vote_only_bank: false,
         }
     }
 
@@ -1138,6 +1157,7 @@ impl Bank {
             shrink_ratio,
             debug_do_not_add_builtins,
             Some(ACCOUNTS_DB_CONFIG_FOR_TESTING),
+            None,
         )
     }
 
@@ -1163,6 +1183,7 @@ impl Bank {
             shrink_ratio,
             debug_do_not_add_builtins,
             Some(ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS),
+            None,
         )
     }
 
@@ -1178,6 +1199,7 @@ impl Bank {
         shrink_ratio: AccountShrinkThreshold,
         debug_do_not_add_builtins: bool,
         accounts_db_config: Option<AccountsDbConfig>,
+        accounts_update_notifier: Option<AccountsUpdateNotifier>,
     ) -> Self {
         let accounts = Accounts::new_with_config(
             paths,
@@ -1186,6 +1208,7 @@ impl Bank {
             accounts_db_caching_enabled,
             shrink_ratio,
             accounts_db_config,
+            accounts_update_notifier,
         );
         let mut bank = Self::default_with_accounts(accounts);
         bank.ancestors = Ancestors::from(vec![bank.slot()]);
@@ -1223,24 +1246,51 @@ impl Bank {
 
     /// Create a new bank that points to an immutable checkpoint of another bank.
     pub fn new_from_parent(parent: &Arc<Bank>, collector_id: &Pubkey, slot: Slot) -> Self {
-        Self::_new_from_parent(parent, collector_id, slot, &mut null_tracer())
+        Self::_new_from_parent(
+            parent,
+            collector_id,
+            slot,
+            null_tracer(),
+            NewBankOptions::default(),
+        )
+    }
+
+    pub fn new_from_parent_with_options(
+        parent: &Arc<Bank>,
+        collector_id: &Pubkey,
+        slot: Slot,
+        new_bank_options: NewBankOptions,
+    ) -> Self {
+        Self::_new_from_parent(parent, collector_id, slot, null_tracer(), new_bank_options)
     }
 
     pub fn new_from_parent_with_tracer(
         parent: &Arc<Bank>,
         collector_id: &Pubkey,
         slot: Slot,
-        reward_calc_tracer: impl FnMut(&RewardCalculationEvent),
+        reward_calc_tracer: impl Fn(&RewardCalculationEvent) + Send + Sync,
     ) -> Self {
-        Self::_new_from_parent(parent, collector_id, slot, &mut Some(reward_calc_tracer))
+        Self::_new_from_parent(
+            parent,
+            collector_id,
+            slot,
+            Some(reward_calc_tracer),
+            NewBankOptions::default(),
+        )
     }
 
     fn _new_from_parent(
         parent: &Arc<Bank>,
         collector_id: &Pubkey,
         slot: Slot,
-        reward_calc_tracer: &mut Option<impl FnMut(&RewardCalculationEvent)>,
+        reward_calc_tracer: Option<impl Fn(&RewardCalculationEvent) + Send + Sync>,
+        new_bank_options: NewBankOptions,
     ) -> Self {
+        let NewBankOptions {
+            vote_only_bank,
+            disable_epoch_boundary_optimization,
+        } = new_bank_options;
+
         parent.freeze();
         assert_ne!(slot, parent.slot());
 
@@ -1288,6 +1338,7 @@ impl Bank {
             fee_calculator: fee_rate_governor.create_fee_calculator(),
             fee_rate_governor,
             capitalization: AtomicU64::new(parent.capitalization()),
+            vote_only_bank,
             inflation: parent.inflation.clone(),
             transaction_count: AtomicU64::new(parent.transaction_count()),
             transaction_error_count: AtomicU64::new(0),
@@ -1305,7 +1356,7 @@ impl Bank {
             is_delta: AtomicBool::new(false),
             tick_height: AtomicU64::new(parent.tick_height.load(Relaxed)),
             signature_count: AtomicU64::new(0),
-            message_processor: parent.message_processor.clone(),
+            instruction_processor: parent.instruction_processor.clone(),
             compute_budget: parent.compute_budget,
             feature_builtins: parent.feature_builtins.clone(),
             hard_forks: parent.hard_forks.clone(),
@@ -1353,6 +1404,45 @@ impl Bank {
             new.apply_feature_activations(false, false);
         }
 
+        let optimize_epoch_boundary_updates = !disable_epoch_boundary_optimization
+            && new
+                .feature_set
+                .is_active(&feature_set::optimize_epoch_boundary_updates::id());
+
+        if optimize_epoch_boundary_updates {
+            if parent_epoch < new.epoch() {
+                let thread_pool = ThreadPoolBuilder::new().build().unwrap();
+
+                // Add new entry to stakes.stake_history, set appropriate epoch and
+                //   update vote accounts with warmed up stakes before saving a
+                //   snapshot of stakes in epoch stakes
+                new.stakes
+                    .write()
+                    .unwrap()
+                    .activate_epoch(epoch, &thread_pool);
+
+                // Save a snapshot of stakes for use in consensus and stake weighted networking
+                let leader_schedule_epoch = epoch_schedule.get_leader_schedule_epoch(slot);
+                new.update_epoch_stakes(leader_schedule_epoch);
+
+                // After saving a snapshot of stakes, apply stake rewards and commission
+                new.update_rewards_with_thread_pool(parent_epoch, reward_calc_tracer, &thread_pool);
+            } else {
+                // Save a snapshot of stakes for use in consensus and stake weighted networking
+                let leader_schedule_epoch = epoch_schedule.get_leader_schedule_epoch(slot);
+                new.update_epoch_stakes(leader_schedule_epoch);
+            }
+
+            // Update sysvars before processing transactions
+            new.update_slot_hashes();
+            new.update_stake_history(Some(parent_epoch));
+            new.update_clock(Some(parent_epoch));
+            new.update_fees();
+
+            return new;
+        }
+
+        #[allow(deprecated)]
         let cloned = new.stakes.read().unwrap().clone_with_epoch(epoch);
         *new.stakes.write().unwrap() = cloned;
 
@@ -1376,6 +1466,10 @@ impl Bank {
 
     pub fn set_callback(&self, callback: Option<Box<dyn DropCallback + Send + Sync>>) {
         *self.drop_callback.write().unwrap() = OptionalDropCallback(callback);
+    }
+
+    pub fn vote_only_bank(&self) -> bool {
+        self.vote_only_bank
     }
 
     /// Like `new_from_parent` but additionally:
@@ -1456,7 +1550,7 @@ impl Bank {
             stakes: RwLock::new(fields.stakes),
             epoch_stakes: fields.epoch_stakes,
             is_delta: AtomicBool::new(fields.is_delta),
-            message_processor: new(),
+            instruction_processor: new(),
             compute_budget: None,
             feature_builtins: new(),
             last_vote_sync: new(),
@@ -1473,6 +1567,7 @@ impl Bank {
             feature_set: new(),
             drop_callback: RwLock::new(OptionalDropCallback(None)),
             freeze_started: AtomicBool::new(fields.hash != Hash::default()),
+            vote_only_bank: false,
         };
         bank.finish_init(
             genesis_config,
@@ -1916,7 +2011,7 @@ impl Bank {
     fn update_rewards(
         &mut self,
         prev_epoch: Epoch,
-        reward_calc_tracer: &mut Option<impl FnMut(&RewardCalculationEvent)>,
+        reward_calc_tracer: Option<impl Fn(&RewardCalculationEvent) + Send + Sync>,
     ) {
         if prev_epoch == self.epoch() {
             return;
@@ -1940,6 +2035,7 @@ impl Bank {
 
         let old_vote_balance_and_staked = self.stakes.read().unwrap().vote_balance_and_staked();
 
+        #[allow(deprecated)]
         let validator_point_value = self.pay_validator_rewards(
             prev_epoch,
             validator_rewards,
@@ -2013,14 +2109,113 @@ impl Bank {
         );
     }
 
+    // update rewards based on the previous epoch
+    fn update_rewards_with_thread_pool(
+        &mut self,
+        prev_epoch: Epoch,
+        reward_calc_tracer: Option<impl Fn(&RewardCalculationEvent) + Send + Sync>,
+        thread_pool: &ThreadPool,
+    ) {
+        let slot_in_year = self.slot_in_year_for_inflation();
+        let epoch_duration_in_years = self.epoch_duration_in_years(prev_epoch);
+
+        let (validator_rate, foundation_rate) = {
+            let inflation = self.inflation.read().unwrap();
+            (
+                (*inflation).validator(slot_in_year),
+                (*inflation).foundation(slot_in_year),
+            )
+        };
+
+        let capitalization = self.capitalization();
+        let validator_rewards =
+            (validator_rate * capitalization as f64 * epoch_duration_in_years) as u64;
+
+        let old_vote_balance_and_staked = self.stakes.read().unwrap().vote_balance_and_staked();
+
+        let validator_point_value = self.pay_validator_rewards_with_thread_pool(
+            prev_epoch,
+            validator_rewards,
+            reward_calc_tracer,
+            self.stake_program_advance_activating_credits_observed(),
+            thread_pool,
+        );
+
+        if !self
+            .feature_set
+            .is_active(&feature_set::deprecate_rewards_sysvar::id())
+        {
+            // this sysvar can be retired once `pico_inflation` is enabled on all clusters
+            self.update_sysvar_account(&sysvar::rewards::id(), |account| {
+                create_account(
+                    &sysvar::rewards::Rewards::new(validator_point_value),
+                    self.inherit_specially_retained_account_fields(account),
+                )
+            });
+        }
+
+        let new_vote_balance_and_staked = self.stakes.read().unwrap().vote_balance_and_staked();
+        let validator_rewards_paid = new_vote_balance_and_staked - old_vote_balance_and_staked;
+        assert_eq!(
+            validator_rewards_paid,
+            u64::try_from(
+                self.rewards
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|(_address, reward_info)| {
+                        match reward_info.reward_type {
+                            RewardType::Voting | RewardType::Staking => reward_info.lamports,
+                            _ => 0,
+                        }
+                    })
+                    .sum::<i64>()
+            )
+            .unwrap()
+        );
+
+        // verify that we didn't pay any more than we expected to
+        assert!(validator_rewards >= validator_rewards_paid);
+
+        info!(
+            "distributed inflation: {} (rounded from: {})",
+            validator_rewards_paid, validator_rewards
+        );
+
+        self.capitalization
+            .fetch_add(validator_rewards_paid, Relaxed);
+
+        let active_stake = if let Some(stake_history_entry) =
+            self.stakes.read().unwrap().history().get(&prev_epoch)
+        {
+            stake_history_entry.effective
+        } else {
+            0
+        };
+
+        datapoint_warn!(
+            "epoch_rewards",
+            ("slot", self.slot, i64),
+            ("epoch", prev_epoch, i64),
+            ("validator_rate", validator_rate, f64),
+            ("foundation_rate", foundation_rate, f64),
+            ("epoch_duration_in_years", epoch_duration_in_years, f64),
+            ("validator_rewards", validator_rewards_paid, i64),
+            ("active_stake", active_stake, i64),
+            ("pre_capitalization", capitalization, i64),
+            ("post_capitalization", self.capitalization(), i64)
+        );
+    }
+
     /// map stake delegations into resolved (pubkey, account) pairs
     ///  returns a map (has to be copied) of loaded
     ///   ( Vec<(staker info)> (voter account) ) keyed by voter pubkey
     ///
     /// Filters out invalid pairs
+    #[deprecated(note = "remove after optimize_epoch_boundary_updates feature is active")]
     fn stake_delegation_accounts(
         &self,
-        reward_calc_tracer: &mut Option<impl FnMut(&RewardCalculationEvent)>,
+        reward_calc_tracer: Option<impl Fn(&RewardCalculationEvent) + Send + Sync>,
     ) -> HashMap<Pubkey, (Vec<(Pubkey, AccountSharedData)>, AccountSharedData)> {
         let mut accounts = HashMap::new();
 
@@ -2036,7 +2231,7 @@ impl Bank {
                 ) {
                     (Some(stake_account), Some(vote_account)) => {
                         // call tracer to catch any illegal data if any
-                        if let Some(reward_calc_tracer) = reward_calc_tracer {
+                        if let Some(reward_calc_tracer) = reward_calc_tracer.as_ref() {
                             reward_calc_tracer(&RewardCalculationEvent::Staking(
                                 stake_pubkey,
                                 &InflationPointCalculationEvent::Delegation(
@@ -2048,7 +2243,7 @@ impl Bank {
                         if self
                             .feature_set
                             .is_active(&feature_set::filter_stake_delegation_accounts::id())
-                            && (stake_account.owner() != &stake::program::id()
+                            && (stake_account.owner() != &solana_stake_program::id()
                                 || vote_account.owner() != &solana_vote_program::id())
                         {
                             datapoint_warn!(
@@ -2075,18 +2270,128 @@ impl Bank {
         accounts
     }
 
+    /// map stake delegations into resolved (pubkey, account) pairs
+    ///  returns a map (has to be copied) of loaded
+    ///   ( Vec<(staker info)> (voter account) ) keyed by voter pubkey
+    ///
+    /// Filters out invalid pairs
+    fn load_vote_and_stake_accounts_with_thread_pool(
+        &self,
+        thread_pool: &ThreadPool,
+        reward_calc_tracer: Option<impl Fn(&RewardCalculationEvent) + Send + Sync>,
+    ) -> DashMap<Pubkey, VoteWithStakeDelegations> {
+        let filter_stake_delegation_accounts = self
+            .feature_set
+            .is_active(&feature_set::filter_stake_delegation_accounts::id());
+
+        let stakes = self.stakes.read().unwrap();
+        let accounts = DashMap::with_capacity(stakes.vote_accounts().as_ref().len());
+
+        thread_pool.install(|| {
+            stakes
+                .stake_delegations()
+                .par_iter()
+                .for_each(|(stake_pubkey, delegation)| {
+                    let vote_pubkey = &delegation.voter_pubkey;
+                    let stake_account = match self.get_account_with_fixed_root(stake_pubkey) {
+                        Some(stake_account) => stake_account,
+                        None => return,
+                    };
+
+                    // fetch vote account from stakes cache if it hasn't been cached locally
+                    let fetched_vote_account = if !accounts.contains_key(vote_pubkey) {
+                        let vote_account = match self.get_account_with_fixed_root(vote_pubkey) {
+                            Some(vote_account) => vote_account,
+                            None => return,
+                        };
+
+                        let vote_state: VoteState =
+                            match StateMut::<VoteStateVersions>::state(&vote_account) {
+                                Ok(vote_state) => vote_state.convert_to_current(),
+                                Err(err) => {
+                                    debug!(
+                                        "failed to deserialize vote account {}: {}",
+                                        vote_pubkey, err
+                                    );
+                                    return;
+                                }
+                            };
+
+                        Some((vote_state, vote_account))
+                    } else {
+                        None
+                    };
+
+                    let fetched_vote_account_owner = fetched_vote_account
+                        .as_ref()
+                        .map(|(_vote_state, vote_account)| vote_account.owner());
+
+                    if let Some(reward_calc_tracer) = reward_calc_tracer.as_ref() {
+                        reward_calc_tracer(&RewardCalculationEvent::Staking(
+                            stake_pubkey,
+                            &InflationPointCalculationEvent::Delegation(
+                                *delegation,
+                                fetched_vote_account_owner
+                                    .cloned()
+                                    .unwrap_or_else(solana_vote_program::id),
+                            ),
+                        ));
+                    }
+
+                    // filter invalid delegation accounts
+                    if filter_stake_delegation_accounts
+                        && (stake_account.owner() != &solana_stake_program::id()
+                            || (fetched_vote_account_owner.is_some()
+                                && fetched_vote_account_owner != Some(&solana_vote_program::id())))
+                    {
+                        datapoint_warn!(
+                            "bank-stake_delegation_accounts-invalid-account",
+                            ("slot", self.slot() as i64, i64),
+                            ("stake-address", format!("{:?}", stake_pubkey), String),
+                            ("vote-address", format!("{:?}", vote_pubkey), String),
+                        );
+                        return;
+                    }
+
+                    let stake_delegation = match stake_account.state().ok() {
+                        Some(stake_state) => (*stake_pubkey, (stake_state, stake_account)),
+                        None => return,
+                    };
+
+                    if let Some((vote_state, vote_account)) = fetched_vote_account {
+                        accounts
+                            .entry(*vote_pubkey)
+                            .or_insert_with(|| VoteWithStakeDelegations {
+                                vote_state: Arc::new(vote_state),
+                                vote_account,
+                                delegations: vec![],
+                            });
+                    }
+
+                    if let Some(mut stake_delegation_accounts) = accounts.get_mut(vote_pubkey) {
+                        stake_delegation_accounts.delegations.push(stake_delegation);
+                    }
+                });
+        });
+
+        accounts
+    }
+
     /// iterate over all stakes, redeem vote credits for each stake we can
     ///   successfully load and parse, return the lamport value of one point
+    #[deprecated(note = "remove after optimize_epoch_boundary_updates feature is active")]
     fn pay_validator_rewards(
         &mut self,
         rewarded_epoch: Epoch,
         rewards: u64,
-        reward_calc_tracer: &mut Option<impl FnMut(&RewardCalculationEvent)>,
+        reward_calc_tracer: Option<impl Fn(&RewardCalculationEvent) + Send + Sync>,
         fix_activating_credits_observed: bool,
     ) -> f64 {
         let stake_history = self.stakes.read().unwrap().history().clone();
 
-        let mut stake_delegation_accounts = self.stake_delegation_accounts(reward_calc_tracer);
+        #[allow(deprecated)]
+        let mut stake_delegation_accounts =
+            self.stake_delegation_accounts(reward_calc_tracer.as_ref());
 
         let points: u128 = stake_delegation_accounts
             .iter()
@@ -2096,8 +2401,13 @@ impl Bank {
                     .map(move |(_stake_pubkey, stake_account)| (stake_account, vote_account))
             })
             .map(|(stake_account, vote_account)| {
-                stake_state::calculate_points(stake_account, vote_account, Some(&stake_history))
-                    .unwrap_or(0)
+                #[allow(deprecated)]
+                stake_state::calculate_points_slow(
+                    stake_account,
+                    vote_account,
+                    Some(&stake_history),
+                )
+                .unwrap_or(0)
             })
             .sum();
 
@@ -2126,21 +2436,22 @@ impl Bank {
 
             for (stake_pubkey, stake_account) in stake_group.iter_mut() {
                 // curry closure to add the contextual stake_pubkey
-                let mut reward_calc_tracer = reward_calc_tracer.as_mut().map(|outer| {
+                let reward_calc_tracer = reward_calc_tracer.as_ref().map(|outer| {
                     let stake_pubkey = *stake_pubkey;
                     // inner
                     move |inner_event: &_| {
                         outer(&RewardCalculationEvent::Staking(&stake_pubkey, inner_event))
                     }
                 });
-                let redeemed = stake_state::redeem_rewards(
+                #[allow(deprecated)]
+                let redeemed = stake_state::redeem_rewards_slow(
                     rewarded_epoch,
                     stake_account,
                     vote_account,
                     &vote_state,
                     &point_value,
                     Some(&stake_history),
-                    &mut reward_calc_tracer.as_mut(),
+                    reward_calc_tracer,
                     fix_activating_credits_observed,
                 );
                 if let Ok((stakers_reward, _voters_reward)) = redeemed {
@@ -2184,6 +2495,176 @@ impl Bank {
             }
         }
         self.rewards.write().unwrap().append(&mut rewards);
+
+        point_value.rewards as f64 / point_value.points as f64
+    }
+
+    /// iterate over all stakes, redeem vote credits for each stake we can
+    ///   successfully load and parse, return the lamport value of one point
+    fn pay_validator_rewards_with_thread_pool(
+        &mut self,
+        rewarded_epoch: Epoch,
+        rewards: u64,
+        reward_calc_tracer: Option<impl Fn(&RewardCalculationEvent) + Send + Sync>,
+        fix_activating_credits_observed: bool,
+        thread_pool: &ThreadPool,
+    ) -> f64 {
+        let stake_history = self.stakes.read().unwrap().history().clone();
+        let vote_and_stake_accounts = self.load_vote_and_stake_accounts_with_thread_pool(
+            thread_pool,
+            reward_calc_tracer.as_ref(),
+        );
+
+        let points: u128 = thread_pool.install(|| {
+            vote_and_stake_accounts
+                .par_iter()
+                .map(|entry| {
+                    let VoteWithStakeDelegations {
+                        vote_state,
+                        delegations,
+                        ..
+                    } = entry.value();
+
+                    delegations
+                        .par_iter()
+                        .map(|(_stake_pubkey, (stake_state, _stake_account))| {
+                            stake_state::calculate_points(
+                                stake_state,
+                                vote_state,
+                                Some(&stake_history),
+                            )
+                            .unwrap_or(0)
+                        })
+                        .sum::<u128>()
+                })
+                .sum()
+        });
+
+        if points == 0 {
+            return 0.0;
+        }
+
+        // pay according to point value
+        let point_value = PointValue { rewards, points };
+        let vote_account_rewards: DashMap<Pubkey, (AccountSharedData, u8, u64, bool)> =
+            DashMap::with_capacity(vote_and_stake_accounts.len());
+        let stake_delegation_iterator = vote_and_stake_accounts.into_par_iter().flat_map(
+            |(
+                vote_pubkey,
+                VoteWithStakeDelegations {
+                    vote_state,
+                    vote_account,
+                    delegations,
+                },
+            )| {
+                vote_account_rewards
+                    .insert(vote_pubkey, (vote_account, vote_state.commission, 0, false));
+                delegations
+                    .into_par_iter()
+                    .map(move |delegation| (vote_pubkey, Arc::clone(&vote_state), delegation))
+            },
+        );
+
+        let mut stake_rewards = thread_pool.install(|| {
+            stake_delegation_iterator
+                .filter_map(
+                    |(
+                        vote_pubkey,
+                        vote_state,
+                        (stake_pubkey, (stake_state, mut stake_account)),
+                    )| {
+                        // curry closure to add the contextual stake_pubkey
+                        let reward_calc_tracer = reward_calc_tracer.as_ref().map(|outer| {
+                            // inner
+                            move |inner_event: &_| {
+                                outer(&RewardCalculationEvent::Staking(&stake_pubkey, inner_event))
+                            }
+                        });
+                        let redeemed = stake_state::redeem_rewards(
+                            rewarded_epoch,
+                            stake_state,
+                            &mut stake_account,
+                            &vote_state,
+                            &point_value,
+                            Some(&stake_history),
+                            reward_calc_tracer.as_ref(),
+                            fix_activating_credits_observed,
+                        );
+                        if let Ok((stakers_reward, voters_reward)) = redeemed {
+                            // track voter rewards
+                            if let Some((
+                                _vote_account,
+                                _commission,
+                                vote_rewards_sum,
+                                vote_needs_store,
+                            )) = vote_account_rewards.get_mut(&vote_pubkey).as_deref_mut()
+                            {
+                                *vote_needs_store = true;
+                                *vote_rewards_sum = vote_rewards_sum.saturating_add(voters_reward);
+                            }
+
+                            // store stake account even if stakers_reward is 0
+                            // because credits observed has changed
+                            self.store_account(&stake_pubkey, &stake_account);
+
+                            if stakers_reward > 0 {
+                                return Some((
+                                    stake_pubkey,
+                                    RewardInfo {
+                                        reward_type: RewardType::Staking,
+                                        lamports: stakers_reward as i64,
+                                        post_balance: stake_account.lamports(),
+                                        commission: Some(vote_state.commission),
+                                    },
+                                ));
+                            }
+                        } else {
+                            debug!(
+                                "stake_state::redeem_rewards() failed for {}: {:?}",
+                                stake_pubkey, redeemed
+                            );
+                        }
+                        None
+                    },
+                )
+                .collect()
+        });
+
+        let mut vote_rewards = vote_account_rewards
+            .into_iter()
+            .filter_map(
+                |(vote_pubkey, (mut vote_account, commission, vote_rewards, vote_needs_store))| {
+                    if let Err(err) = vote_account.checked_add_lamports(vote_rewards) {
+                        debug!("reward redemption failed for {}: {:?}", vote_pubkey, err);
+                        return None;
+                    }
+
+                    if vote_needs_store {
+                        self.store_account(&vote_pubkey, &vote_account);
+                    }
+
+                    if vote_rewards > 0 {
+                        Some((
+                            vote_pubkey,
+                            RewardInfo {
+                                reward_type: RewardType::Voting,
+                                lamports: vote_rewards as i64,
+                                post_balance: vote_account.lamports(),
+                                commission: Some(commission),
+                            },
+                        ))
+                    } else {
+                        None
+                    }
+                },
+            )
+            .collect();
+
+        {
+            let mut rewards = self.rewards.write().unwrap();
+            rewards.append(&mut vote_rewards);
+            rewards.append(&mut stake_rewards);
+        }
 
         point_value.rewards as f64 / point_value.points as f64
     }
@@ -2343,6 +2824,7 @@ impl Bank {
     // Should not be called outside of startup, will race with
     // concurrent cleaning logic in AccountsBackgroundService
     pub fn exhaustively_free_unused_resource(&self, last_full_snapshot_slot: Option<Slot>) {
+        const IS_STARTUP: bool = true; // this is only called at startup, and we want to use more threads
         let mut flush = Measure::start("flush");
         // Flush all the rooted accounts. Must be called after `squash()`,
         // so that AccountsDb knows what the roots are.
@@ -2354,11 +2836,10 @@ impl Bank {
         // accounts that were included in the bank delta hash when the bank was frozen,
         // and if we clean them here, any newly created snapshot's hash for this bank
         // may not match the frozen hash.
-        self.clean_accounts(true, false, last_full_snapshot_slot);
+        self.clean_accounts(true, IS_STARTUP, last_full_snapshot_slot);
         clean.stop();
 
         let mut shrink = Measure::start("shrink");
-        const IS_STARTUP: bool = true; // this is only called at startup, and we want to use more threads
         self.shrink_all_slots(IS_STARTUP, last_full_snapshot_slot);
         shrink.stop();
 
@@ -2422,9 +2903,11 @@ impl Bank {
         self.fee_calculator = self.fee_rate_governor.create_fee_calculator();
 
         for (pubkey, account) in genesis_config.accounts.iter() {
-            if self.get_account(pubkey).is_some() {
-                panic!("{} repeated in genesis config", pubkey);
-            }
+            assert!(
+                self.get_account(pubkey).is_none(),
+                "{} repeated in genesis config",
+                pubkey
+            );
             self.store_account(pubkey, &AccountSharedData::from(account.clone()));
             self.capitalization.fetch_add(account.lamports(), Relaxed);
         }
@@ -2433,9 +2916,11 @@ impl Bank {
         self.update_fees();
 
         for (pubkey, account) in genesis_config.rewards_pools.iter() {
-            if self.get_account(pubkey).is_some() {
-                panic!("{} repeated in genesis config", pubkey);
-            }
+            assert!(
+                self.get_account(pubkey).is_none(),
+                "{} repeated in genesis config",
+                pubkey
+            );
             self.store_account(pubkey, &AccountSharedData::from(account.clone()));
         }
 
@@ -2473,38 +2958,38 @@ impl Bank {
 
         // Add additional native programs specified in the genesis config
         for (name, program_id) in &genesis_config.native_instruction_processors {
-            self.add_native_program(name, program_id, false);
+            self.add_builtin_account(name, program_id, false);
         }
     }
 
+    fn burn_and_purge_account(&self, program_id: &Pubkey, mut account: AccountSharedData) {
+        self.capitalization.fetch_sub(account.lamports(), Relaxed);
+        // Resetting account balance to 0 is needed to really purge from AccountsDb and
+        // flush the Stakes cache
+        account.set_lamports(0);
+        self.store_account(program_id, &account);
+    }
+
     // NOTE: must hold idempotent for the same set of arguments
-    pub fn add_native_program(&self, name: &str, program_id: &Pubkey, must_replace: bool) {
+    /// Add a builtin program account
+    pub fn add_builtin_account(&self, name: &str, program_id: &Pubkey, must_replace: bool) {
         let existing_genuine_program =
-            if let Some(mut account) = self.get_account_with_fixed_root(program_id) {
-                // it's very unlikely to be squatted at program_id as non-system account because of burden to
-                // find victim's pubkey/hash. So, when account.owner is indeed native_loader's, it's
-                // safe to assume it's a genuine program.
-                if native_loader::check_id(account.owner()) {
-                    Some(account)
-                } else {
-                    // malicious account is pre-occupying at program_id
-                    // forcibly burn and purge it
-
-                    self.capitalization.fetch_sub(account.lamports(), Relaxed);
-
-                    // Resetting account balance to 0 is needed to really purge from AccountsDb and
-                    // flush the Stakes cache
-                    account.set_lamports(0);
-                    self.store_account(program_id, &account);
-                    None
-                }
-            } else {
-                None
-            };
+            self.get_account_with_fixed_root(program_id)
+                .and_then(|account| {
+                    // it's very unlikely to be squatted at program_id as non-system account because of burden to
+                    // find victim's pubkey/hash. So, when account.owner is indeed native_loader's, it's
+                    // safe to assume it's a genuine program.
+                    if native_loader::check_id(account.owner()) {
+                        Some(account)
+                    } else {
+                        // malicious account is pre-occupying at program_id
+                        self.burn_and_purge_account(program_id, account);
+                        None
+                    }
+                });
 
         if must_replace {
             // updating native program
-
             match &existing_genuine_program {
                 None => panic!(
                     "There is no account to replace with native program ({}, {}).",
@@ -2512,29 +2997,16 @@ impl Bank {
                 ),
                 Some(account) => {
                     if *name == String::from_utf8_lossy(account.data()) {
-                        // nop; it seems that already AccountsDb is updated.
+                        // The existing account is well formed
                         return;
                     }
-                    // continue to replace account
                 }
             }
         } else {
             // introducing native program
-
-            match &existing_genuine_program {
-                None => (), // continue to add account
-                Some(_account) => {
-                    // nop; it seems that we already have account
-
-                    // before returning here to retain idempotent just make sure
-                    // the existing native program name is same with what we're
-                    // supposed to add here (but skipping) But I can't:
-                    // following assertion already catches several different names for same
-                    // program_id
-                    // depending on clusters...
-                    // assert_eq!(name.to_owned(), String::from_utf8_lossy(&account.data));
-                    return;
-                }
+            if existing_genuine_program.is_some() {
+                // The existing account is sufficient
+                return;
             }
         }
 
@@ -2552,8 +3024,37 @@ impl Bank {
             self.inherit_specially_retained_account_fields(&existing_genuine_program),
         );
         self.store_account_and_update_capitalization(program_id, &account);
+    }
 
-        debug!("Added native program {} under {:?}", name, program_id);
+    /// Add a precompiled program account
+    pub fn add_precompiled_account(&self, program_id: &Pubkey) {
+        if let Some(account) = self.get_account_with_fixed_root(program_id) {
+            if account.executable() {
+                // The account is already executable, that's all we need
+                return;
+            } else {
+                // malicious account is pre-occupying at program_id
+                self.burn_and_purge_account(program_id, account);
+            }
+        };
+
+        assert!(
+            !self.freeze_started(),
+            "Can't change frozen bank by adding not-existing new precompiled program ({}). \
+                Maybe, inconsistent program activation is detected on snapshot restore?",
+            program_id
+        );
+
+        // Add a bogus executable account, which will be loaded and ignored.
+        let (lamports, rent_epoch) = self.inherit_specially_retained_account_fields(&None);
+        let account = AccountSharedData::from(Account {
+            lamports,
+            owner: solana_sdk::system_program::id(),
+            data: vec![],
+            executable: true,
+            rent_epoch,
+        });
+        self.store_account_and_update_capitalization(program_id, &account);
     }
 
     pub fn set_rent_burn_percentage(&mut self, burn_percent: u8) {
@@ -2575,7 +3076,7 @@ impl Bank {
     }
 
     pub fn get_minimum_balance_for_rent_exemption(&self, data_len: usize) -> u64 {
-        self.rent_collector.rent.minimum_balance(data_len)
+        self.rent_collector.rent.minimum_balance(data_len).max(1)
     }
 
     #[deprecated(
@@ -2607,11 +3108,8 @@ impl Bank {
         &self.fee_rate_governor
     }
 
-    pub fn get_fee_for_message(&self, hash: &Hash, message: &SanitizedMessage) -> Option<u64> {
-        let blockhash_queue = self.blockhash_queue.read().unwrap();
-        #[allow(deprecated)]
-        let fee_calculator = blockhash_queue.get_fee_calculator(hash)?;
-        Some(message.calculate_fee(fee_calculator))
+    pub fn get_fee_for_message(&self, message: &SanitizedMessage) -> Option<u64> {
+        Some(message.calculate_fee(self.fee_rate_governor.lamports_per_signature))
     }
 
     #[deprecated(
@@ -2818,6 +3316,7 @@ impl Bank {
     ) -> TransactionSimulationResult {
         assert!(self.is_frozen(), "simulation bank must be frozen");
 
+        let number_of_accounts = transaction.message().account_keys_len();
         let batch = self.prepare_simulation_batch(transaction);
         let mut timings = ExecuteTimings::default();
 
@@ -2848,7 +3347,13 @@ impl Bank {
             .unwrap()
             .0
             .ok()
-            .map(|loaded_transaction| loaded_transaction.accounts.into_iter().collect::<Vec<_>>())
+            .map(|loaded_transaction| {
+                loaded_transaction
+                    .accounts
+                    .into_iter()
+                    .take(number_of_accounts)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
 
         let units_consumed = timings
@@ -3011,23 +3516,14 @@ impl Bank {
         sanitized_txs: &[SanitizedTransaction],
         lock_results: &[Result<()>],
         max_age: usize,
-        mut error_counters: &mut ErrorCounters,
+        error_counters: &mut ErrorCounters,
     ) -> Vec<TransactionCheckResult> {
-        let age_results = self.check_age(
-            sanitized_txs.iter(),
-            lock_results,
-            max_age,
-            &mut error_counters,
-        );
-        let cache_results =
-            self.check_status_cache(sanitized_txs, age_results, &mut error_counters);
+        let age_results =
+            self.check_age(sanitized_txs.iter(), lock_results, max_age, error_counters);
+        let cache_results = self.check_status_cache(sanitized_txs, age_results, error_counters);
         if self.upgrade_epoch() {
             // Reject all non-vote transactions
-            self.filter_by_vote_transactions(
-                sanitized_txs.iter(),
-                cache_results,
-                &mut error_counters,
-            )
+            self.filter_by_vote_transactions(sanitized_txs.iter(), cache_results, error_counters)
         } else {
             cache_results
         }
@@ -3129,32 +3625,19 @@ impl Bank {
 
     /// Converts Accounts into RefCell<AccountSharedData>, this involves moving
     /// ownership by draining the source
-    fn accounts_to_refcells(
-        accounts: &mut TransactionAccounts,
-        loaders: &mut TransactionLoaders,
-    ) -> (TransactionAccountRefCells, TransactionLoaderRefCells) {
+    fn accounts_to_refcells(accounts: &mut TransactionAccounts) -> TransactionAccountRefCells {
         let account_refcells: Vec<_> = accounts
             .drain(..)
             .map(|(pubkey, account)| (pubkey, Rc::new(RefCell::new(account))))
             .collect();
-        let loader_refcells: Vec<Vec<_>> = loaders
-            .iter_mut()
-            .map(|v| {
-                v.drain(..)
-                    .map(|(pubkey, account)| (pubkey, Rc::new(RefCell::new(account))))
-                    .collect()
-            })
-            .collect();
-        (account_refcells, loader_refcells)
+        account_refcells
     }
 
     /// Converts back from RefCell<AccountSharedData> to AccountSharedData, this involves moving
     /// ownership by draining the sources
     fn refcells_to_accounts(
         accounts: &mut TransactionAccounts,
-        loaders: &mut TransactionLoaders,
         mut account_refcells: TransactionAccountRefCells,
-        loader_refcells: TransactionLoaderRefCells,
     ) -> std::result::Result<(), TransactionError> {
         for (pubkey, account_refcell) in account_refcells.drain(..) {
             accounts.push((
@@ -3163,16 +3646,6 @@ impl Bank {
                     .map_err(|_| TransactionError::AccountBorrowOutstanding)?
                     .into_inner(),
             ))
-        }
-        for (ls, mut lrcs) in loaders.iter_mut().zip(loader_refcells) {
-            for (pubkey, lrc) in lrcs.drain(..) {
-                ls.push((
-                    pubkey,
-                    Rc::try_unwrap(lrc)
-                        .map_err(|_| TransactionError::AccountBorrowOutstanding)?
-                        .into_inner(),
-                ))
-            }
         }
 
         Ok(())
@@ -3200,11 +3673,12 @@ impl Bank {
     fn get_executors(
         &self,
         message: &SanitizedMessage,
-        loaders: &[Vec<(Pubkey, AccountSharedData)>],
+        accounts: &[(Pubkey, AccountSharedData)],
+        program_indices: &[Vec<usize>],
     ) -> Rc<RefCell<Executors>> {
         let mut num_executors = message.account_keys_len();
-        for instruction_loaders in loaders.iter() {
-            num_executors += instruction_loaders.len();
+        for program_indices_of_instruction in program_indices.iter() {
+            num_executors += program_indices_of_instruction.len();
         }
         let mut executors = HashMap::with_capacity(num_executors);
         let cow_cache = self.cached_executors.read().unwrap();
@@ -3215,10 +3689,11 @@ impl Bank {
                 executors.insert(*key, executor);
             }
         }
-        for instruction_loaders in loaders.iter() {
-            for (key, _) in instruction_loaders.iter() {
-                if let Some(executor) = cache.get(key) {
-                    executors.insert(*key, executor);
+        for program_indices_of_instruction in program_indices.iter() {
+            for account_index in program_indices_of_instruction.iter() {
+                let key = accounts[*account_index].0;
+                if let Some(executor) = cache.get(&key) {
+                    executors.insert(key, executor);
                 }
             }
         }
@@ -3334,13 +3809,14 @@ impl Bank {
                     };
 
                     if process_result.is_ok() {
-                        let executors =
-                            self.get_executors(tx.message(), &loaded_transaction.loaders);
-
-                        let (account_refcells, loader_refcells) = Self::accounts_to_refcells(
-                            &mut loaded_transaction.accounts,
-                            &mut loaded_transaction.loaders,
+                        let executors = self.get_executors(
+                            tx.message(),
+                            &loaded_transaction.accounts,
+                            &loaded_transaction.program_indices,
                         );
+
+                        let account_refcells =
+                            Self::accounts_to_refcells(&mut loaded_transaction.accounts);
 
                         let instruction_recorders = if enable_cpi_recording {
                             let ix_count = tx.message().instructions().len();
@@ -3375,9 +3851,10 @@ impl Bank {
                         };
 
                         if let Some(legacy_message) = tx.message().legacy_message() {
-                            process_result = self.message_processor.process_message(
+                            process_result = MessageProcessor::process_message(
+                                &self.instruction_processor,
                                 legacy_message,
-                                &loader_refcells,
+                                &loaded_transaction.program_indices,
                                 &account_refcells,
                                 &self.rent_collector,
                                 log_collector.clone(),
@@ -3405,9 +3882,7 @@ impl Bank {
 
                         if let Err(e) = Self::refcells_to_accounts(
                             &mut loaded_transaction.accounts,
-                            &mut loaded_transaction.loaders,
                             account_refcells,
-                            loader_refcells,
                         ) {
                             warn!("Account lifetime mismanagement");
                             process_result = Err(e);
@@ -3564,7 +4039,9 @@ impl Bank {
                     });
 
                 let fee_calculator = fee_calculator.ok_or(TransactionError::BlockhashNotFound)?;
-                let fee = tx.message().calculate_fee(&fee_calculator);
+                let fee = tx
+                    .message()
+                    .calculate_fee(fee_calculator.lamports_per_signature);
 
                 match *res {
                     Err(TransactionError::InstructionError(_, _)) => {
@@ -3864,10 +4341,18 @@ impl Bank {
         }
 
         let mut measure = Measure::start("collect_rent_eagerly-ms");
-        for partition in self.rent_collection_partitions() {
-            self.collect_rent_in_partition(partition);
-        }
+        let partitions = self.rent_collection_partitions();
+        let count = partitions.len();
+        let account_count: usize = partitions
+            .into_iter()
+            .map(|partition| self.collect_rent_in_partition(partition))
+            .sum();
         measure.stop();
+        datapoint_info!(
+            "collect_rent_eagerly",
+            ("accounts", account_count, i64),
+            ("partitions", count, i64)
+        );
         inc_new_counter_info!("collect_rent_eagerly-ms", measure.as_ms() as usize);
     }
 
@@ -3904,13 +4389,15 @@ impl Bank {
         }
     }
 
-    fn collect_rent_in_partition(&self, partition: Partition) {
+    fn collect_rent_in_partition(&self, partition: Partition) -> usize {
         let subrange = Self::pubkey_range_from_partition(partition);
+
+        self.rc.accounts.hold_range_in_memory(&subrange, true);
 
         let accounts = self
             .rc
             .accounts
-            .load_to_collect_rent_eagerly(&self.ancestors, subrange);
+            .load_to_collect_rent_eagerly(&self.ancestors, subrange.clone());
         let account_count = accounts.len();
 
         // parallelize?
@@ -3922,6 +4409,7 @@ impl Bank {
                 &pubkey,
                 &mut account,
                 rent_for_sysvars,
+                self.rc.accounts.accounts_db.filler_account_suffix.as_ref(),
             );
             total_rent += rent;
             // Store all of them unconditionally to purge old AppendVec,
@@ -3935,14 +4423,15 @@ impl Bank {
         self.collected_rent.fetch_add(total_rent, Relaxed);
         self.rewards.write().unwrap().append(&mut rent_debits.0);
 
-        datapoint_info!("collect_rent_eagerly", ("accounts", account_count, i64));
+        self.rc.accounts.hold_range_in_memory(&subrange, false);
+        account_count
     }
 
     // Mostly, the pair (start_index & end_index) is equivalent to this range:
     // start_index..=end_index. But it has some exceptional cases, including
     // this important and valid one:
     //   0..=0: the first partition in the new epoch when crossing epochs
-    fn pubkey_range_from_partition(
+    pub fn pubkey_range_from_partition(
         (start_index, end_index, partition_count): Partition,
     ) -> RangeInclusive<Pubkey> {
         assert!(start_index <= end_index);
@@ -4007,13 +4496,15 @@ impl Bank {
         Pubkey::new_from_array(start_pubkey)..=Pubkey::new_from_array(end_pubkey)
     }
 
-    fn fixed_cycle_partitions(&self) -> Vec<Partition> {
-        let slot_count_in_two_day = self.slot_count_in_two_day();
-
-        let parent_cycle = self.parent_slot() / slot_count_in_two_day;
-        let current_cycle = self.slot() / slot_count_in_two_day;
-        let mut parent_cycle_index = self.parent_slot() % slot_count_in_two_day;
-        let current_cycle_index = self.slot() % slot_count_in_two_day;
+    pub fn get_partitions(
+        slot: Slot,
+        parent_slot: Slot,
+        slot_count_in_two_day: SlotCount,
+    ) -> Vec<Partition> {
+        let parent_cycle = parent_slot / slot_count_in_two_day;
+        let current_cycle = slot / slot_count_in_two_day;
+        let mut parent_cycle_index = parent_slot % slot_count_in_two_day;
+        let current_cycle_index = slot % slot_count_in_two_day;
         let mut partitions = vec![];
         if parent_cycle < current_cycle {
             if current_cycle_index > 0 {
@@ -4040,6 +4531,11 @@ impl Bank {
         ));
 
         partitions
+    }
+
+    fn fixed_cycle_partitions(&self) -> Vec<Partition> {
+        let slot_count_in_two_day = self.slot_count_in_two_day();
+        Self::get_partitions(self.slot(), self.parent_slot(), slot_count_in_two_day)
     }
 
     fn variable_cycle_partitions(&self) -> Vec<Partition> {
@@ -4233,11 +4729,15 @@ impl Bank {
             && self.slot_count_per_normal_epoch() < self.slot_count_in_two_day()
     }
 
+    fn slot_count_in_two_day(&self) -> SlotCount {
+        Self::slot_count_in_two_day_helper(self.ticks_per_slot)
+    }
+
     // This value is specially chosen to align with slots per epoch in mainnet-beta and testnet
     // Also, assume 500GB account data set as the extreme, then for 2 day (=48 hours) to collect
     // rent eagerly, we'll consume 5.7 MB/s IO bandwidth, bidirectionally.
-    fn slot_count_in_two_day(&self) -> SlotCount {
-        2 * DEFAULT_TICKS_PER_SECOND * SECONDS_PER_DAY / self.ticks_per_slot
+    pub fn slot_count_in_two_day_helper(ticks_per_slot: SlotCount) -> SlotCount {
+        2 * DEFAULT_TICKS_PER_SECOND * SECONDS_PER_DAY / ticks_per_slot
     }
 
     fn slot_count_per_normal_epoch(&self) -> SlotCount {
@@ -4425,7 +4925,7 @@ impl Bank {
             self.stakes.write().unwrap().store(
                 pubkey,
                 account,
-                self.check_init_vote_data_enabled(),
+                self.stakes_remove_delegation_if_inactive_enabled(),
             );
         }
     }
@@ -4563,9 +5063,14 @@ impl Bank {
             for builtin in builtins.genesis_builtins {
                 self.add_builtin(
                     &builtin.name,
-                    builtin.id,
+                    &builtin.id,
                     builtin.process_instruction_with_context,
                 );
+            }
+            for precompile in get_precompiles() {
+                if precompile.feature.is_none() {
+                    self.add_precompile(&precompile.program_id);
+                }
             }
         }
         self.feature_builtins = Arc::new(builtins.feature_builtins);
@@ -4579,15 +5084,6 @@ impl Bank {
 
     pub fn set_compute_budget(&mut self, compute_budget: Option<ComputeBudget>) {
         self.compute_budget = compute_budget;
-    }
-
-    #[allow(deprecated)]
-    #[deprecated(since = "1.8.0", note = "please use `set_compute_budget` instead")]
-    pub fn set_bpf_compute_budget(
-        &mut self,
-        bpf_compute_budget: Option<solana_sdk::process_instruction::BpfComputeBudget>,
-    ) {
-        self.compute_budget = bpf_compute_budget.map(|budget| budget.into());
     }
 
     pub fn hard_forks(&self) -> Arc<RwLock<HardForks>> {
@@ -4870,6 +5366,7 @@ impl Bank {
 
     /// Recalculate the hash_internal_state from the account stores. Would be used to verify a
     /// snapshot.
+    /// Only called from startup or test code.
     #[must_use]
     fn verify_bank_hash(&self, test_hash_calculation: bool) -> bool {
         self.rc.accounts.verify_bank_hash_and_lamports(
@@ -4985,8 +5482,9 @@ impl Bank {
     pub fn update_accounts_hash_with_index_option(
         &self,
         use_index: bool,
-        debug_verify: bool,
+        mut debug_verify: bool,
         slots_per_epoch: Option<Slot>,
+        is_startup: bool,
     ) -> Hash {
         let (hash, total_lamports) = self
             .rc
@@ -5000,6 +5498,7 @@ impl Bank {
                 Some(self.capitalization()),
                 false,
                 slots_per_epoch,
+                is_startup,
             );
         if total_lamports != self.capitalization() {
             datapoint_info!(
@@ -5008,6 +5507,25 @@ impl Bank {
                 ("calculated_lamports", total_lamports, i64),
                 ("capitalization", self.capitalization(), i64),
             );
+
+            if !debug_verify {
+                // cap mismatch detected. It has been logged to metrics above.
+                // Run both versions of the calculation to attempt to get more info.
+                debug_verify = true;
+                self.rc
+                    .accounts
+                    .accounts_db
+                    .update_accounts_hash_with_index_option(
+                        use_index,
+                        debug_verify,
+                        self.slot(),
+                        &self.ancestors,
+                        Some(self.capitalization()),
+                        false,
+                        slots_per_epoch,
+                        is_startup,
+                    );
+            }
 
             panic!(
                 "capitalization_mismatch. slot: {}, calculated_lamports: {}, capitalization: {}",
@@ -5020,7 +5538,7 @@ impl Bank {
     }
 
     pub fn update_accounts_hash(&self) -> Hash {
-        self.update_accounts_hash_with_index_option(true, false, None)
+        self.update_accounts_hash_with_index_option(true, false, None, false)
     }
 
     /// A snapshot bank should be purged of 0 lamport accounts which are not part of the hash
@@ -5038,6 +5556,11 @@ impl Bank {
         }
         clean_time.stop();
 
+        self.rc
+            .accounts
+            .accounts_db
+            .accounts_index
+            .set_startup(true);
         let mut shrink_all_slots_time = Measure::start("shrink_all_slots");
         if !accounts_db_skip_shrink && self.slot() > 0 {
             info!("shrinking..");
@@ -5049,6 +5572,11 @@ impl Bank {
         let mut verify_time = Measure::start("verify_bank_hash");
         let mut verify = self.verify_bank_hash(test_hash_calculation);
         verify_time.stop();
+        self.rc
+            .accounts
+            .accounts_db
+            .accounts_index
+            .set_startup(false);
 
         info!("verify_hash..");
         let mut verify2_time = Measure::start("verify_hash");
@@ -5146,7 +5674,7 @@ impl Bank {
                 if let Some(old_vote_account) = self.stakes.write().unwrap().store(
                     pubkey,
                     account,
-                    self.check_init_vote_data_enabled(),
+                    self.stakes_remove_delegation_if_inactive_enabled(),
                 ) {
                     // TODO: one of the indices is redundant.
                     overwritten_vote_accounts.push(OverwrittenVoteAccount {
@@ -5277,26 +5805,43 @@ impl Bank {
     pub fn add_builtin(
         &mut self,
         name: &str,
-        program_id: Pubkey,
+        program_id: &Pubkey,
         process_instruction_with_context: ProcessInstructionWithContext,
     ) {
         debug!("Adding program {} under {:?}", name, program_id);
-        self.add_native_program(name, &program_id, false);
-        self.message_processor
+        self.add_builtin_account(name, program_id, false);
+        self.instruction_processor
             .add_program(program_id, process_instruction_with_context);
+        debug!("Added program {} under {:?}", name, program_id);
     }
 
     /// Replace a builtin instruction processor if it already exists
     pub fn replace_builtin(
         &mut self,
         name: &str,
-        program_id: Pubkey,
+        program_id: &Pubkey,
         process_instruction_with_context: ProcessInstructionWithContext,
     ) {
         debug!("Replacing program {} under {:?}", name, program_id);
-        self.add_native_program(name, &program_id, true);
-        self.message_processor
+        self.add_builtin_account(name, program_id, true);
+        self.instruction_processor
             .add_program(program_id, process_instruction_with_context);
+        debug!("Replaced program {} under {:?}", name, program_id);
+    }
+
+    /// Remove a builtin instruction processor if it already exists
+    pub fn remove_builtin(&mut self, name: &str, program_id: &Pubkey) {
+        debug!("Removing program {} under {:?}", name, program_id);
+        // Don't remove the account since the bank expects the account state to
+        // be idempotent
+        self.instruction_processor.remove_program(program_id);
+        debug!("Removed program {} under {:?}", name, program_id);
+    }
+
+    pub fn add_precompile(&mut self, program_id: &Pubkey) {
+        debug!("Adding precompiled program {}", program_id);
+        self.add_precompiled_account(program_id);
+        debug!("Added precompiled program {:?}", program_id);
     }
 
     pub fn clean_accounts(
@@ -5359,11 +5904,6 @@ impl Bank {
             .is_active(&feature_set::no_overflow_rent_distribution::id())
     }
 
-    pub fn check_init_vote_data_enabled(&self) -> bool {
-        self.feature_set
-            .is_active(&feature_set::check_init_vote_data::id())
-    }
-
     pub fn verify_tx_signatures_len_enabled(&self) -> bool {
         self.feature_set
             .is_active(&feature_set::verify_tx_signatures_len::id())
@@ -5389,6 +5929,16 @@ impl Bank {
             .is_active(&feature_set::demote_program_write_locks::id())
     }
 
+    pub fn stakes_remove_delegation_if_inactive_enabled(&self) -> bool {
+        self.feature_set
+            .is_active(&feature_set::stakes_remove_delegation_if_inactive::id())
+    }
+
+    pub fn send_to_tpu_vote_port_enabled(&self) -> bool {
+        self.feature_set
+            .is_active(&feature_set::send_to_tpu_vote_port::id())
+    }
+
     // Check if the wallclock time from bank creation to now has exceeded the allotted
     // time for transaction processing
     pub fn should_bank_still_be_processing_txs(
@@ -5411,6 +5961,20 @@ impl Bank {
         feature_set.inactive.remove(id);
         feature_set.active.insert(*id, 0);
         self.feature_set = Arc::new(feature_set);
+    }
+
+    pub fn fill_bank_with_ticks(&self) {
+        let parent_distance = if self.slot() == 0 {
+            1
+        } else {
+            self.slot() - self.parent_slot()
+        };
+        for _ in 0..parent_distance {
+            let last_blockhash = self.last_blockhash();
+            while self.last_blockhash() == last_blockhash {
+                self.register_tick(&Hash::new_unique())
+            }
+        }
     }
 
     // This is called from snapshot restore AND for each epoch boundary
@@ -5548,15 +6112,26 @@ impl Bank {
                 match activation_type {
                     ActivationType::NewProgram => self.add_builtin(
                         &builtin.name,
-                        builtin.id,
+                        &builtin.id,
                         builtin.process_instruction_with_context,
                     ),
                     ActivationType::NewVersion => self.replace_builtin(
                         &builtin.name,
-                        builtin.id,
+                        &builtin.id,
                         builtin.process_instruction_with_context,
                     ),
+                    ActivationType::RemoveProgram => {
+                        self.remove_builtin(&builtin.name, &builtin.id)
+                    }
                 }
+            }
+        }
+        for precompile in get_precompiles() {
+            #[allow(clippy::blocks_in_if_conditions)]
+            if precompile.feature.map_or(false, |ref feature_id| {
+                self.feature_set.is_active(feature_id)
+            }) {
+                self.add_precompile(&precompile.program_id);
             }
         }
     }
@@ -5732,7 +6307,6 @@ pub(crate) mod tests {
         status_cache::MAX_CACHE_ENTRIES,
     };
     use crossbeam_channel::{bounded, unbounded};
-    use solana_program_runtime::NativeLoaderError;
     #[allow(deprecated)]
     use solana_sdk::sysvar::fees::Fees;
     use solana_sdk::{
@@ -5988,16 +6562,16 @@ pub(crate) mod tests {
             cluster_type: ClusterType::MainnetBeta,
             ..GenesisConfig::default()
         }));
-        let sysvar_and_native_proram_delta0 = 11;
+        let sysvar_and_native_program_delta0 = 11;
         assert_eq!(
             bank0.capitalization(),
-            42 * 42 + sysvar_and_native_proram_delta0
+            42 * 42 + sysvar_and_native_program_delta0
         );
         let bank1 = Bank::new_from_parent(&bank0, &Pubkey::default(), 1);
-        let sysvar_and_native_proram_delta1 = 2;
+        let sysvar_and_native_program_delta1 = 2;
         assert_eq!(
             bank1.capitalization(),
-            42 * 42 + sysvar_and_native_proram_delta0 + sysvar_and_native_proram_delta1,
+            42 * 42 + sysvar_and_native_program_delta0 + sysvar_and_native_program_delta1,
         );
     }
 
@@ -6117,7 +6691,7 @@ pub(crate) mod tests {
     }
 
     fn mock_process_instruction(
-        _program_id: &Pubkey,
+        first_instruction_account: usize,
         data: &[u8],
         invoke_context: &mut dyn InvokeContext,
     ) -> result::Result<(), InstructionError> {
@@ -6125,11 +6699,11 @@ pub(crate) mod tests {
         if let Ok(instruction) = bincode::deserialize(data) {
             match instruction {
                 MockInstruction::Deduction => {
-                    keyed_accounts[1]
+                    keyed_accounts[first_instruction_account + 1]
                         .account
                         .borrow_mut()
                         .checked_add_lamports(1)?;
-                    keyed_accounts[2]
+                    keyed_accounts[first_instruction_account + 2]
                         .account
                         .borrow_mut()
                         .checked_sub_lamports(1)?;
@@ -6280,7 +6854,7 @@ pub(crate) mod tests {
             ) as u64,
         );
         bank.rent_collector.slots_per_year = 421_812.0;
-        bank.add_builtin("mock_program", mock_program_id, mock_process_instruction);
+        bank.add_builtin("mock_program", &mock_program_id, mock_process_instruction);
 
         bank
     }
@@ -6594,10 +7168,10 @@ pub(crate) mod tests {
         let current_capitalization = bank.capitalization.load(Relaxed);
 
         // only slot history is newly created
-        let sysvar_and_native_proram_delta =
+        let sysvar_and_native_program_delta =
             min_rent_excempt_balance_for_sysvars(&bank, &[sysvar::slot_history::id()]);
         assert_eq!(
-            previous_capitalization - (current_capitalization - sysvar_and_native_proram_delta),
+            previous_capitalization - (current_capitalization - sysvar_and_native_program_delta),
             burned_portion
         );
 
@@ -7724,17 +8298,28 @@ pub(crate) mod tests {
         }
         bank0.store_account_and_update_capitalization(&vote_id, &vote_account);
 
+        let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
         let validator_points: u128 = bank0
-            .stake_delegation_accounts(&mut null_tracer())
-            .iter()
-            .flat_map(|(_vote_pubkey, (stake_group, vote_account))| {
-                stake_group
-                    .iter()
-                    .map(move |(_stake_pubkey, stake_account)| (stake_account, vote_account))
-            })
-            .map(|(stake_account, vote_account)| {
-                stake_state::calculate_points(stake_account, vote_account, None).unwrap_or(0)
-            })
+            .load_vote_and_stake_accounts_with_thread_pool(&thread_pool, null_tracer())
+            .into_iter()
+            .map(
+                |(
+                    _vote_pubkey,
+                    VoteWithStakeDelegations {
+                        vote_state,
+                        delegations,
+                        ..
+                    },
+                )| {
+                    delegations
+                        .iter()
+                        .map(move |(_stake_pubkey, (stake_state, _stake_account))| {
+                            stake_state::calculate_points(stake_state, &vote_state, None)
+                                .unwrap_or(0)
+                        })
+                        .sum::<u128>()
+                },
+            )
             .sum();
 
         // put a child bank in epoch 1, which calls update_rewards()...
@@ -7747,9 +8332,9 @@ pub(crate) mod tests {
         assert_ne!(bank1.capitalization(), bank0.capitalization());
 
         // verify the inflation is represented in validator_points *
-        let sysvar_and_native_proram_delta1 = 2;
+        let sysvar_and_native_program_delta1 = 2;
         let paid_rewards =
-            bank1.capitalization() - bank0.capitalization() - sysvar_and_native_proram_delta1;
+            bank1.capitalization() - bank0.capitalization() - sysvar_and_native_program_delta1;
 
         let rewards = bank1
             .get_account(&sysvar::rewards::id())
@@ -7816,10 +8401,10 @@ pub(crate) mod tests {
         // not being eagerly-collected for exact rewards calculation
         bank.restore_old_behavior_for_fragile_tests();
 
-        let sysvar_and_native_proram_delta = 11;
+        let sysvar_and_native_program_delta = 11;
         assert_eq!(
             bank.capitalization(),
-            42 * 1_000_000_000 + sysvar_and_native_proram_delta
+            42 * 1_000_000_000 + sysvar_and_native_program_delta
         );
         assert!(bank.rewards.read().unwrap().is_empty());
 
@@ -8267,9 +8852,9 @@ pub(crate) mod tests {
         ); // Leader collects fee after the bank is frozen
 
         // verify capitalization
-        let sysvar_and_native_proram_delta = 1;
+        let sysvar_and_native_program_delta = 1;
         assert_eq!(
-            capitalization - expected_fee_burned + sysvar_and_native_proram_delta,
+            capitalization - expected_fee_burned + sysvar_and_native_program_delta,
             bank.capitalization()
         );
 
@@ -9753,10 +10338,11 @@ pub(crate) mod tests {
             Pubkey::new(&[42u8; 32])
         }
         fn mock_vote_processor(
-            program_id: &Pubkey,
+            _first_instruction_account: usize,
             _instruction_data: &[u8],
-            _invoke_context: &mut dyn InvokeContext,
+            invoke_context: &mut dyn InvokeContext,
         ) -> std::result::Result<(), InstructionError> {
+            let program_id = invoke_context.get_caller()?;
             if mock_vote_program_id() != *program_id {
                 return Err(InstructionError::IncorrectProgramId);
             }
@@ -9766,7 +10352,7 @@ pub(crate) mod tests {
         assert!(bank.get_account(&mock_vote_program_id()).is_none());
         bank.add_builtin(
             "mock_vote_program",
-            mock_vote_program_id(),
+            &mock_vote_program_id(),
             mock_vote_processor,
         );
         assert!(bank.get_account(&mock_vote_program_id()).is_some());
@@ -9810,7 +10396,7 @@ pub(crate) mod tests {
         let mut bank = Bank::new_for_tests(&genesis_config);
 
         fn mock_vote_processor(
-            _pubkey: &Pubkey,
+            _first_instruction_account: usize,
             _data: &[u8],
             _invoke_context: &mut dyn InvokeContext,
         ) -> std::result::Result<(), InstructionError> {
@@ -9839,7 +10425,7 @@ pub(crate) mod tests {
         let vote_loader_account = bank.get_account(&solana_vote_program::id()).unwrap();
         bank.add_builtin(
             "solana_vote_program",
-            solana_vote_program::id(),
+            &solana_vote_program::id(),
             mock_vote_processor,
         );
         let new_vote_loader_account = bank.get_account(&solana_vote_program::id()).unwrap();
@@ -9860,7 +10446,7 @@ pub(crate) mod tests {
         let mut bank = Bank::new_for_tests(&genesis_config);
 
         fn mock_ix_processor(
-            _pubkey: &Pubkey,
+            _first_instruction_account: usize,
             _data: &[u8],
             _invoke_context: &mut dyn InvokeContext,
         ) -> std::result::Result<(), InstructionError> {
@@ -9888,8 +10474,8 @@ pub(crate) mod tests {
         assert!(!bank.stakes.read().unwrap().stake_delegations().is_empty());
         assert_eq!(bank.calculate_capitalization(true), bank.capitalization());
 
-        bank.add_builtin("mock_program1", vote_id, mock_ix_processor);
-        bank.add_builtin("mock_program2", stake_id, mock_ix_processor);
+        bank.add_builtin("mock_program1", &vote_id, mock_ix_processor);
+        bank.add_builtin("mock_program2", &stake_id, mock_ix_processor);
         {
             let stakes = bank.stakes.read().unwrap();
             assert!(stakes.vote_accounts().as_ref().is_empty());
@@ -9908,8 +10494,8 @@ pub(crate) mod tests {
         // Re-adding builtin programs should be no-op
         bank.update_accounts_hash();
         let old_hash = bank.get_accounts_hash();
-        bank.add_builtin("mock_program1", vote_id, mock_ix_processor);
-        bank.add_builtin("mock_program2", stake_id, mock_ix_processor);
+        bank.add_builtin("mock_program1", &vote_id, mock_ix_processor);
+        bank.add_builtin("mock_program2", &stake_id, mock_ix_processor);
         bank.update_accounts_hash();
         let new_hash = bank.get_accounts_hash();
         assert_eq!(old_hash, new_hash);
@@ -10328,10 +10914,7 @@ pub(crate) mod tests {
         /* Check balances */
         let mut expected_balance = 4_650_000
             - bank
-                .get_fee_for_message(
-                    &bank.last_blockhash(),
-                    &durable_tx.message.try_into().unwrap(),
-                )
+                .get_fee_for_message(&durable_tx.message.try_into().unwrap())
                 .unwrap();
         assert_eq!(bank.get_balance(&custodian_pubkey), expected_balance);
         assert_eq!(bank.get_balance(&nonce_pubkey), 250_000);
@@ -10385,10 +10968,7 @@ pub(crate) mod tests {
         );
         /* Check fee charged and nonce has advanced */
         expected_balance -= bank
-            .get_fee_for_message(
-                &bank.last_blockhash(),
-                &SanitizedMessage::try_from(durable_tx.message.clone()).unwrap(),
-            )
+            .get_fee_for_message(&SanitizedMessage::try_from(durable_tx.message.clone()).unwrap())
             .unwrap();
         assert_eq!(bank.get_balance(&custodian_pubkey), expected_balance);
         assert_ne!(nonce_hash, get_nonce_account(&bank, &nonce_pubkey).unwrap());
@@ -10452,10 +11032,7 @@ pub(crate) mod tests {
             bank.get_balance(&custodian_pubkey),
             initial_custodian_balance
                 - bank
-                    .get_fee_for_message(
-                        &bank.last_blockhash(),
-                        &durable_tx.message.try_into().unwrap()
-                    )
+                    .get_fee_for_message(&durable_tx.message.try_into().unwrap())
                     .unwrap()
         );
         assert_eq!(nonce_hash, get_nonce_account(&bank, &nonce_pubkey).unwrap());
@@ -10507,10 +11084,7 @@ pub(crate) mod tests {
             bank.get_balance(&nonce_pubkey),
             nonce_starting_balance
                 - bank
-                    .get_fee_for_message(
-                        &bank.last_blockhash(),
-                        &durable_tx.message.try_into().unwrap()
-                    )
+                    .get_fee_for_message(&durable_tx.message.try_into().unwrap())
                     .unwrap()
         );
         assert_ne!(nonce_hash, get_nonce_account(&bank, &nonce_pubkey).unwrap());
@@ -10701,29 +11275,31 @@ pub(crate) mod tests {
         let mut bank = Bank::new_for_tests(&genesis_config);
 
         fn mock_process_instruction(
-            _program_id: &Pubkey,
+            first_instruction_account: usize,
             data: &[u8],
             invoke_context: &mut dyn InvokeContext,
         ) -> result::Result<(), InstructionError> {
             let keyed_accounts = invoke_context.get_keyed_accounts()?;
             let lamports = data[0] as u64;
             {
-                let mut to_account = keyed_accounts[1].try_account_ref_mut()?;
-                let mut dup_account = keyed_accounts[2].try_account_ref_mut()?;
+                let mut to_account =
+                    keyed_accounts[first_instruction_account + 1].try_account_ref_mut()?;
+                let mut dup_account =
+                    keyed_accounts[first_instruction_account + 2].try_account_ref_mut()?;
                 dup_account.checked_sub_lamports(lamports)?;
                 to_account.checked_add_lamports(lamports)?;
             }
-            keyed_accounts[0]
+            keyed_accounts[first_instruction_account]
                 .try_account_ref_mut()?
                 .checked_sub_lamports(lamports)?;
-            keyed_accounts[1]
+            keyed_accounts[first_instruction_account + 1]
                 .try_account_ref_mut()?
                 .checked_add_lamports(lamports)?;
             Ok(())
         }
 
         let mock_program_id = Pubkey::new(&[2u8; 32]);
-        bank.add_builtin("mock_program", mock_program_id, mock_process_instruction);
+        bank.add_builtin("mock_program", &mock_program_id, mock_process_instruction);
 
         let from_pubkey = solana_sdk::pubkey::new_rand();
         let to_pubkey = solana_sdk::pubkey::new_rand();
@@ -10759,7 +11335,7 @@ pub(crate) mod tests {
 
         #[allow(clippy::unnecessary_wraps)]
         fn mock_process_instruction(
-            _program_id: &Pubkey,
+            _first_instruction_account: usize,
             _data: &[u8],
             _invoke_context: &mut dyn InvokeContext,
         ) -> result::Result<(), InstructionError> {
@@ -10767,7 +11343,7 @@ pub(crate) mod tests {
         }
 
         let mock_program_id = Pubkey::new(&[2u8; 32]);
-        bank.add_builtin("mock_program", mock_program_id, mock_process_instruction);
+        bank.add_builtin("mock_program", &mock_program_id, mock_process_instruction);
 
         let from_pubkey = solana_sdk::pubkey::new_rand();
         let to_pubkey = solana_sdk::pubkey::new_rand();
@@ -10822,7 +11398,7 @@ pub(crate) mod tests {
 
         bank.add_builtin(
             "mock_vote",
-            solana_vote_program::id(),
+            &solana_vote_program::id(),
             mock_ok_vote_processor,
         );
         let result = bank.process_transaction(&tx);
@@ -10876,7 +11452,7 @@ pub(crate) mod tests {
 
         bank.add_builtin(
             "mock_vote",
-            solana_vote_program::id(),
+            &solana_vote_program::id(),
             mock_ok_vote_processor,
         );
 
@@ -10910,7 +11486,7 @@ pub(crate) mod tests {
 
         bank.add_builtin(
             "mock_vote",
-            solana_vote_program::id(),
+            &solana_vote_program::id(),
             mock_ok_vote_processor,
         );
 
@@ -10945,7 +11521,7 @@ pub(crate) mod tests {
 
     #[allow(clippy::unnecessary_wraps)]
     fn mock_ok_vote_processor(
-        _pubkey: &Pubkey,
+        _first_instruction_account: usize,
         _data: &[u8],
         _invoke_context: &mut dyn InvokeContext,
     ) -> std::result::Result<(), InstructionError> {
@@ -10967,7 +11543,7 @@ pub(crate) mod tests {
 
         bank.add_builtin(
             "mock_vote",
-            solana_vote_program::id(),
+            &solana_vote_program::id(),
             mock_ok_vote_processor,
         );
 
@@ -11002,7 +11578,7 @@ pub(crate) mod tests {
             .map(|i| {
                 let key = solana_sdk::pubkey::new_rand();
                 let name = format!("program{:?}", i);
-                bank.add_builtin(&name, key, mock_ok_vote_processor);
+                bank.add_builtin(&name, &key, mock_ok_vote_processor);
                 (key, name.as_bytes().to_vec())
             })
             .collect();
@@ -11195,13 +11771,18 @@ pub(crate) mod tests {
     #[test]
     fn test_same_program_id_uses_unqiue_executable_accounts() {
         fn nested_processor(
-            _program_id: &Pubkey,
+            first_instruction_account: usize,
             _data: &[u8],
             invoke_context: &mut dyn InvokeContext,
         ) -> result::Result<(), InstructionError> {
             let keyed_accounts = invoke_context.get_keyed_accounts()?;
-            assert_eq!(42, keyed_accounts[0].lamports().unwrap());
-            let mut account = keyed_accounts[0].try_account_ref_mut()?;
+            assert_eq!(
+                42,
+                keyed_accounts[first_instruction_account]
+                    .lamports()
+                    .unwrap()
+            );
+            let mut account = keyed_accounts[first_instruction_account].try_account_ref_mut()?;
             account.checked_add_lamports(1)?;
             Ok(())
         }
@@ -11211,7 +11792,7 @@ pub(crate) mod tests {
 
         // Add a new program
         let program1_pubkey = solana_sdk::pubkey::new_rand();
-        bank.add_builtin("program", program1_pubkey, nested_processor);
+        bank.add_builtin("program", &program1_pubkey, nested_processor);
 
         // Add a new program owned by the first
         let program2_pubkey = solana_sdk::pubkey::new_rand();
@@ -11561,7 +12142,7 @@ pub(crate) mod tests {
 
         #[allow(clippy::unnecessary_wraps)]
         fn mock_ix_processor(
-            _pubkey: &Pubkey,
+            _first_instruction_account: usize,
             _data: &[u8],
             _invoke_context: &mut dyn InvokeContext,
         ) -> std::result::Result<(), InstructionError> {
@@ -11578,20 +12159,24 @@ pub(crate) mod tests {
         ));
         assert_eq!(bank.get_account_modified_slot(&program_id), None);
 
-        Arc::get_mut(&mut bank)
-            .unwrap()
-            .add_builtin("mock_program", program_id, mock_ix_processor);
+        Arc::get_mut(&mut bank).unwrap().add_builtin(
+            "mock_program",
+            &program_id,
+            mock_ix_processor,
+        );
         assert_eq!(bank.get_account_modified_slot(&program_id).unwrap().1, slot);
 
         let mut bank = Arc::new(new_from_parent(&bank));
-        Arc::get_mut(&mut bank)
-            .unwrap()
-            .add_builtin("mock_program", program_id, mock_ix_processor);
+        Arc::get_mut(&mut bank).unwrap().add_builtin(
+            "mock_program",
+            &program_id,
+            mock_ix_processor,
+        );
         assert_eq!(bank.get_account_modified_slot(&program_id).unwrap().1, slot);
 
         Arc::get_mut(&mut bank).unwrap().replace_builtin(
             "mock_program v2",
-            program_id,
+            &program_id,
             mock_ix_processor,
         );
         assert_eq!(
@@ -11606,7 +12191,7 @@ pub(crate) mod tests {
 
         #[allow(clippy::unnecessary_wraps)]
         fn mock_ix_processor(
-            _pubkey: &Pubkey,
+            _first_instruction_account: usize,
             _data: &[u8],
             _context: &mut dyn InvokeContext,
         ) -> std::result::Result<(), InstructionError> {
@@ -11625,18 +12210,18 @@ pub(crate) mod tests {
 
         Arc::get_mut(&mut bank)
             .unwrap()
-            .add_builtin("mock_program", loader_id, mock_ix_processor);
+            .add_builtin("mock_program", &loader_id, mock_ix_processor);
         assert_eq!(bank.get_account_modified_slot(&loader_id).unwrap().1, slot);
 
         let mut bank = Arc::new(new_from_parent(&bank));
         Arc::get_mut(&mut bank)
             .unwrap()
-            .add_builtin("mock_program", loader_id, mock_ix_processor);
+            .add_builtin("mock_program", &loader_id, mock_ix_processor);
         assert_eq!(bank.get_account_modified_slot(&loader_id).unwrap().1, slot);
     }
 
     #[test]
-    fn test_add_native_program() {
+    fn test_add_builtin_account() {
         let (mut genesis_config, _mint_keypair) = create_genesis_config(100_000);
         activate_all_features(&mut genesis_config);
 
@@ -11652,7 +12237,7 @@ pub(crate) mod tests {
 
         assert_capitalization_diff(
             &bank,
-            || bank.add_native_program("mock_program", &program_id, false),
+            || bank.add_builtin_account("mock_program", &program_id, false),
             |old, new| {
                 assert_eq!(old + 1, new);
             },
@@ -11663,7 +12248,7 @@ pub(crate) mod tests {
         let bank = Arc::new(new_from_parent(&bank));
         assert_capitalization_diff(
             &bank,
-            || bank.add_native_program("mock_program", &program_id, false),
+            || bank.add_builtin_account("mock_program", &program_id, false),
             |old, new| assert_eq!(old, new),
         );
 
@@ -11674,7 +12259,7 @@ pub(crate) mod tests {
         // invocations.
         assert_capitalization_diff(
             &bank,
-            || bank.add_native_program("mock_program v2", &program_id, true),
+            || bank.add_builtin_account("mock_program v2", &program_id, true),
             |old, new| assert_eq!(old, new),
         );
 
@@ -11686,7 +12271,7 @@ pub(crate) mod tests {
         let bank = Arc::new(new_from_parent(&bank));
         assert_capitalization_diff(
             &bank,
-            || bank.add_native_program("mock_program v2", &program_id, true),
+            || bank.add_builtin_account("mock_program v2", &program_id, true),
             |old, new| assert_eq!(old, new),
         );
 
@@ -11698,12 +12283,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_add_native_program_inherited_cap_while_replacing() {
+    fn test_add_builtin_account_inherited_cap_while_replacing() {
         let (genesis_config, mint_keypair) = create_genesis_config(100_000);
         let bank = Bank::new_for_tests(&genesis_config);
         let program_id = solana_sdk::pubkey::new_rand();
 
-        bank.add_native_program("mock_program", &program_id, false);
+        bank.add_builtin_account("mock_program", &program_id, false);
         assert_eq!(bank.capitalization(), bank.calculate_capitalization(true));
 
         // someone mess with program_id's balance
@@ -11712,12 +12297,12 @@ pub(crate) mod tests {
         bank.deposit(&program_id, 10).unwrap();
         assert_eq!(bank.capitalization(), bank.calculate_capitalization(true));
 
-        bank.add_native_program("mock_program v2", &program_id, true);
+        bank.add_builtin_account("mock_program v2", &program_id, true);
         assert_eq!(bank.capitalization(), bank.calculate_capitalization(true));
     }
 
     #[test]
-    fn test_add_native_program_squatted_while_not_replacing() {
+    fn test_add_builtin_account_squatted_while_not_replacing() {
         let (genesis_config, mint_keypair) = create_genesis_config(100_000);
         let bank = Bank::new_for_tests(&genesis_config);
         let program_id = solana_sdk::pubkey::new_rand();
@@ -11728,7 +12313,7 @@ pub(crate) mod tests {
         bank.deposit(&program_id, 10).unwrap();
         assert_eq!(bank.capitalization(), bank.calculate_capitalization(true));
 
-        bank.add_native_program("mock_program", &program_id, false);
+        bank.add_builtin_account("mock_program", &program_id, false);
         assert_eq!(bank.capitalization(), bank.calculate_capitalization(true));
     }
 
@@ -11738,7 +12323,7 @@ pub(crate) mod tests {
                    program (mock_program, CiXgo2KHKSDmDnV1F6B69eWFgNAPiSBjjYvfB4cvRNre). \
                    Maybe, inconsistent program activation is detected on snapshot restore?"
     )]
-    fn test_add_native_program_after_frozen() {
+    fn test_add_builtin_account_after_frozen() {
         use std::str::FromStr;
         let (genesis_config, _mint_keypair) = create_genesis_config(100_000);
 
@@ -11752,7 +12337,7 @@ pub(crate) mod tests {
         );
         bank.freeze();
 
-        bank.add_native_program("mock_program", &program_id, false);
+        bank.add_builtin_account("mock_program", &program_id, false);
     }
 
     #[test]
@@ -11760,7 +12345,7 @@ pub(crate) mod tests {
         expected = "There is no account to replace with native program (mock_program, \
                     CiXgo2KHKSDmDnV1F6B69eWFgNAPiSBjjYvfB4cvRNre)."
     )]
-    fn test_add_native_program_replace_none() {
+    fn test_add_builtin_account_replace_none() {
         use std::str::FromStr;
         let (genesis_config, _mint_keypair) = create_genesis_config(100_000);
 
@@ -11773,7 +12358,100 @@ pub(crate) mod tests {
             slot,
         );
 
-        bank.add_native_program("mock_program", &program_id, true);
+        bank.add_builtin_account("mock_program", &program_id, true);
+    }
+
+    #[test]
+    fn test_add_precompiled_account() {
+        let (mut genesis_config, _mint_keypair) = create_genesis_config(100_000);
+        activate_all_features(&mut genesis_config);
+
+        let slot = 123;
+        let program_id = solana_sdk::pubkey::new_rand();
+
+        let bank = Arc::new(Bank::new_from_parent(
+            &Arc::new(Bank::new_for_tests(&genesis_config)),
+            &Pubkey::default(),
+            slot,
+        ));
+        assert_eq!(bank.get_account_modified_slot(&program_id), None);
+
+        assert_capitalization_diff(
+            &bank,
+            || bank.add_precompiled_account(&program_id),
+            |old, new| {
+                assert_eq!(old + 1, new);
+            },
+        );
+
+        assert_eq!(bank.get_account_modified_slot(&program_id).unwrap().1, slot);
+
+        let bank = Arc::new(new_from_parent(&bank));
+        assert_capitalization_diff(
+            &bank,
+            || bank.add_precompiled_account(&program_id),
+            |old, new| assert_eq!(old, new),
+        );
+
+        assert_eq!(bank.get_account_modified_slot(&program_id).unwrap().1, slot);
+    }
+
+    #[test]
+    fn test_add_precompiled_account_inherited_cap_while_replacing() {
+        let (genesis_config, mint_keypair) = create_genesis_config(100_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let program_id = solana_sdk::pubkey::new_rand();
+
+        bank.add_precompiled_account(&program_id);
+        assert_eq!(bank.capitalization(), bank.calculate_capitalization(true));
+
+        // someone mess with program_id's balance
+        bank.withdraw(&mint_keypair.pubkey(), 10).unwrap();
+        assert_ne!(bank.capitalization(), bank.calculate_capitalization(true));
+        bank.deposit(&program_id, 10).unwrap();
+        assert_eq!(bank.capitalization(), bank.calculate_capitalization(true));
+
+        bank.add_precompiled_account(&program_id);
+        assert_eq!(bank.capitalization(), bank.calculate_capitalization(true));
+    }
+
+    #[test]
+    fn test_add_precompiled_account_squatted_while_not_replacing() {
+        let (genesis_config, mint_keypair) = create_genesis_config(100_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let program_id = solana_sdk::pubkey::new_rand();
+
+        // someone managed to squat at program_id!
+        bank.withdraw(&mint_keypair.pubkey(), 10).unwrap();
+        assert_ne!(bank.capitalization(), bank.calculate_capitalization(true));
+        bank.deposit(&program_id, 10).unwrap();
+        assert_eq!(bank.capitalization(), bank.calculate_capitalization(true));
+
+        bank.add_precompiled_account(&program_id);
+        assert_eq!(bank.capitalization(), bank.calculate_capitalization(true));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Can't change frozen bank by adding not-existing new precompiled \
+                   program (CiXgo2KHKSDmDnV1F6B69eWFgNAPiSBjjYvfB4cvRNre). \
+                   Maybe, inconsistent program activation is detected on snapshot restore?"
+    )]
+    fn test_add_precompiled_account_after_frozen() {
+        use std::str::FromStr;
+        let (genesis_config, _mint_keypair) = create_genesis_config(100_000);
+
+        let slot = 123;
+        let program_id = Pubkey::from_str("CiXgo2KHKSDmDnV1F6B69eWFgNAPiSBjjYvfB4cvRNre").unwrap();
+
+        let bank = Bank::new_from_parent(
+            &Arc::new(Bank::new_for_tests(&genesis_config)),
+            &Pubkey::default(),
+            slot,
+        );
+        bank.freeze();
+
+        bank.add_precompiled_account(&program_id);
     }
 
     #[test]
@@ -11875,9 +12553,9 @@ pub(crate) mod tests {
 
         // assert that everything gets in order....
         assert!(bank1.get_account(&reward_pubkey).is_none());
-        let sysvar_and_native_proram_delta = 1;
+        let sysvar_and_native_program_delta = 1;
         assert_eq!(
-            bank0.capitalization() + 1 + 1_000_000_000 + sysvar_and_native_proram_delta,
+            bank0.capitalization() + 1 + 1_000_000_000 + sysvar_and_native_program_delta,
             bank1.capitalization()
         );
         assert_eq!(bank1.capitalization(), bank1.calculate_capitalization(true));
@@ -11900,8 +12578,7 @@ pub(crate) mod tests {
     impl Executor for TestExecutor {
         fn execute(
             &self,
-            _loader_id: &Pubkey,
-            _program_id: &Pubkey,
+            _first_instruction_account: usize,
             _instruction_data: &[u8],
             _invoke_context: &mut dyn InvokeContext,
             _use_jit: bool,
@@ -12006,12 +12683,11 @@ pub(crate) mod tests {
         .try_into()
         .unwrap();
 
-        let loaders = &[
-            vec![
-                (key3, AccountSharedData::default()),
-                (key4, AccountSharedData::default()),
-            ],
-            vec![(key1, AccountSharedData::default())],
+        let program_indices = &[vec![0, 1], vec![2]];
+        let accounts = &[
+            (key3, AccountSharedData::default()),
+            (key4, AccountSharedData::default()),
+            (key1, AccountSharedData::default()),
         ];
 
         // don't do any work if not dirty
@@ -12023,7 +12699,7 @@ pub(crate) mod tests {
         let executors = Rc::new(RefCell::new(executors));
         executors.borrow_mut().is_dirty = false;
         bank.update_executors(executors);
-        let executors = bank.get_executors(&message, loaders);
+        let executors = bank.get_executors(&message, accounts, program_indices);
         assert_eq!(executors.borrow().executors.len(), 0);
 
         // do work
@@ -12034,7 +12710,7 @@ pub(crate) mod tests {
         executors.insert(key4, executor.clone());
         let executors = Rc::new(RefCell::new(executors));
         bank.update_executors(executors);
-        let executors = bank.get_executors(&message, loaders);
+        let executors = bank.get_executors(&message, accounts, program_indices);
         assert_eq!(executors.borrow().executors.len(), 4);
         assert!(executors.borrow().executors.contains_key(&key1));
         assert!(executors.borrow().executors.contains_key(&key2));
@@ -12043,7 +12719,7 @@ pub(crate) mod tests {
 
         // Check inheritance
         let bank = Bank::new_from_parent(&Arc::new(bank), &solana_sdk::pubkey::new_rand(), 1);
-        let executors = bank.get_executors(&message, loaders);
+        let executors = bank.get_executors(&message, accounts, program_indices);
         assert_eq!(executors.borrow().executors.len(), 4);
         assert!(executors.borrow().executors.contains_key(&key1));
         assert!(executors.borrow().executors.contains_key(&key2));
@@ -12054,7 +12730,7 @@ pub(crate) mod tests {
         bank.remove_executor(&key2);
         bank.remove_executor(&key3);
         bank.remove_executor(&key4);
-        let executors = bank.get_executors(&message, loaders);
+        let executors = bank.get_executors(&message, accounts, program_indices);
         assert_eq!(executors.borrow().executors.len(), 0);
         assert!(!executors.borrow().executors.contains_key(&key1));
         assert!(!executors.borrow().executors.contains_key(&key2));
@@ -12075,25 +12751,26 @@ pub(crate) mod tests {
         let message =
             SanitizedMessage::try_from(Message::new(&[], Some(&Pubkey::new_unique()))).unwrap();
 
-        let loaders = &[vec![
+        let program_indices = &[vec![0, 1]];
+        let accounts = &[
             (key1, AccountSharedData::default()),
             (key2, AccountSharedData::default()),
-        ]];
+        ];
 
         // add one to root bank
         let mut executors = Executors::default();
         executors.insert(key1, executor.clone());
         let executors = Rc::new(RefCell::new(executors));
         root.update_executors(executors);
-        let executors = root.get_executors(&message, loaders);
+        let executors = root.get_executors(&message, accounts, program_indices);
         assert_eq!(executors.borrow().executors.len(), 1);
 
         let fork1 = Bank::new_from_parent(&root, &Pubkey::default(), 1);
         let fork2 = Bank::new_from_parent(&root, &Pubkey::default(), 1);
 
-        let executors = fork1.get_executors(&message, loaders);
+        let executors = fork1.get_executors(&message, accounts, program_indices);
         assert_eq!(executors.borrow().executors.len(), 1);
-        let executors = fork2.get_executors(&message, loaders);
+        let executors = fork2.get_executors(&message, accounts, program_indices);
         assert_eq!(executors.borrow().executors.len(), 1);
 
         let mut executors = Executors::default();
@@ -12101,16 +12778,16 @@ pub(crate) mod tests {
         let executors = Rc::new(RefCell::new(executors));
         fork1.update_executors(executors);
 
-        let executors = fork1.get_executors(&message, loaders);
+        let executors = fork1.get_executors(&message, accounts, program_indices);
         assert_eq!(executors.borrow().executors.len(), 2);
-        let executors = fork2.get_executors(&message, loaders);
+        let executors = fork2.get_executors(&message, accounts, program_indices);
         assert_eq!(executors.borrow().executors.len(), 1);
 
         fork1.remove_executor(&key1);
 
-        let executors = fork1.get_executors(&message, loaders);
+        let executors = fork1.get_executors(&message, accounts, program_indices);
         assert_eq!(executors.borrow().executors.len(), 1);
-        let executors = fork2.get_executors(&message, loaders);
+        let executors = fork2.get_executors(&message, accounts, program_indices);
         assert_eq!(executors.borrow().executors.len(), 1);
     }
 
@@ -12404,7 +13081,7 @@ pub(crate) mod tests {
         // intentionally create bogus native programs
         #[allow(clippy::unnecessary_wraps)]
         fn mock_process_instruction(
-            _program_id: &Pubkey,
+            _first_instruction_account: usize,
             _data: &[u8],
             _invoke_context: &mut dyn InvokeContext,
         ) -> std::result::Result<(), solana_sdk::instruction::InstructionError> {
@@ -12747,67 +13424,6 @@ pub(crate) mod tests {
             Err(TransactionError::InstructionError(
                 0,
                 InstructionError::UnsupportedProgramId
-            ))
-        );
-    }
-
-    #[test]
-    fn test_bad_native_loader() {
-        let (genesis_config, mint_keypair) = create_genesis_config(50000);
-        let bank = Bank::new_for_tests(&genesis_config);
-        let to_keypair = Keypair::new();
-
-        let tx = Transaction::new_signed_with_payer(
-            &[
-                system_instruction::create_account(
-                    &mint_keypair.pubkey(),
-                    &to_keypair.pubkey(),
-                    10000,
-                    0,
-                    &native_loader::id(),
-                ),
-                Instruction::new_with_bincode(
-                    native_loader::id(),
-                    &(),
-                    vec![AccountMeta::new(to_keypair.pubkey(), false)],
-                ),
-            ],
-            Some(&mint_keypair.pubkey()),
-            &[&mint_keypair, &to_keypair],
-            bank.last_blockhash(),
-        );
-        assert_eq!(
-            bank.process_transaction(&tx),
-            Err(TransactionError::InstructionError(
-                1,
-                InstructionError::Custom(NativeLoaderError::InvalidAccountData as u32)
-            ))
-        );
-
-        let tx = Transaction::new_signed_with_payer(
-            &[
-                system_instruction::create_account(
-                    &mint_keypair.pubkey(),
-                    &to_keypair.pubkey(),
-                    10000,
-                    100,
-                    &native_loader::id(),
-                ),
-                Instruction::new_with_bincode(
-                    native_loader::id(),
-                    &(),
-                    vec![AccountMeta::new(to_keypair.pubkey(), false)],
-                ),
-            ],
-            Some(&mint_keypair.pubkey()),
-            &[&mint_keypair, &to_keypair],
-            bank.last_blockhash(),
-        );
-        assert_eq!(
-            bank.process_transaction(&tx),
-            Err(TransactionError::InstructionError(
-                1,
-                InstructionError::Custom(NativeLoaderError::InvalidAccountData as u32)
             ))
         );
     }
@@ -13653,8 +14269,10 @@ pub(crate) mod tests {
             vec![10_000; 2],
         );
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
-        let stake_delegation_accounts = bank.stake_delegation_accounts(&mut null_tracer());
-        assert_eq!(stake_delegation_accounts.len(), 2);
+        let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let vote_and_stake_accounts =
+            bank.load_vote_and_stake_accounts_with_thread_pool(&thread_pool, null_tracer());
+        assert_eq!(vote_and_stake_accounts.len(), 2);
 
         let mut vote_account = bank
             .get_account(&validator_vote_keypairs0.vote_keypair.pubkey())
@@ -13692,8 +14310,10 @@ pub(crate) mod tests {
         );
 
         // Accounts must be valid stake and vote accounts
-        let stake_delegation_accounts = bank.stake_delegation_accounts(&mut null_tracer());
-        assert_eq!(stake_delegation_accounts.len(), 0);
+        let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let vote_and_stake_accounts =
+            bank.load_vote_and_stake_accounts_with_thread_pool(&thread_pool, null_tracer());
+        assert_eq!(vote_and_stake_accounts.len(), 0);
     }
 
     #[test]
@@ -13958,19 +14578,19 @@ pub(crate) mod tests {
         let mut bank = Bank::new_for_tests(&genesis_config);
 
         fn mock_ix_processor(
-            _pubkey: &Pubkey,
+            first_instruction_account: usize,
             _data: &[u8],
             invoke_context: &mut dyn InvokeContext,
         ) -> std::result::Result<(), InstructionError> {
             use solana_sdk::account::WritableAccount;
             let keyed_accounts = invoke_context.get_keyed_accounts()?;
-            let mut data = keyed_accounts[1].try_account_ref_mut()?;
+            let mut data = keyed_accounts[first_instruction_account + 1].try_account_ref_mut()?;
             data.data_as_mut_slice()[0] = 5;
             Ok(())
         }
 
         let program_id = solana_sdk::pubkey::new_rand();
-        bank.add_builtin("mock_program1", program_id, mock_ix_processor);
+        bank.add_builtin("mock_program1", &program_id, mock_ix_processor);
 
         let blockhash = bank.last_blockhash();
         #[allow(deprecated)]
@@ -14167,7 +14787,7 @@ pub(crate) mod tests {
         let mut bank = Bank::new_for_tests(&genesis_config);
 
         fn mock_ix_processor(
-            _pubkey: &Pubkey,
+            _first_instruction_account: usize,
             _data: &[u8],
             invoke_context: &mut dyn InvokeContext,
         ) -> std::result::Result<(), InstructionError> {
@@ -14182,7 +14802,7 @@ pub(crate) mod tests {
             Ok(())
         }
         let program_id = solana_sdk::pubkey::new_rand();
-        bank.add_builtin("mock_program", program_id, mock_ix_processor);
+        bank.add_builtin("mock_program", &program_id, mock_ix_processor);
 
         let message = Message::new(
             &[
@@ -14334,5 +14954,48 @@ pub(crate) mod tests {
                 bank.verify_transaction(tx.into(), false).is_ok(),
             );
         }
+    }
+
+    #[test]
+    fn test_call_precomiled_program() {
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(42, &Pubkey::new_unique(), 42);
+        activate_all_features(&mut genesis_config);
+        let bank = Bank::new_for_tests(&genesis_config);
+
+        // libsecp256k1
+        let secp_privkey = libsecp256k1::SecretKey::random(&mut rand::thread_rng());
+        let message_arr = b"hello";
+        let instruction = solana_sdk::secp256k1_instruction::new_secp256k1_instruction(
+            &secp_privkey,
+            message_arr,
+        );
+        let tx = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&mint_keypair.pubkey()),
+            &[&mint_keypair],
+            bank.last_blockhash(),
+        );
+        // calling the program should be successful when called from the bank
+        // even if the program itself is not called
+        bank.process_transaction(&tx).unwrap();
+
+        // ed25519
+        let privkey = ed25519_dalek::Keypair::generate(&mut rand::thread_rng());
+        let message_arr = b"hello";
+        let instruction =
+            solana_sdk::ed25519_instruction::new_ed25519_instruction(&privkey, message_arr);
+        let tx = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&mint_keypair.pubkey()),
+            &[&mint_keypair],
+            bank.last_blockhash(),
+        );
+        // calling the program should be successful when called from the bank
+        // even if the program itself is not called
+        bank.process_transaction(&tx).unwrap();
     }
 }

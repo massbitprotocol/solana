@@ -32,19 +32,18 @@ use solana_sdk::{
     account::from_account,
     account_utils::StateMut,
     clock::{Clock, UnixTimestamp, SECONDS_PER_DAY},
+    commitment_config::CommitmentConfig,
     epoch_schedule::EpochSchedule,
     message::Message,
     pubkey::Pubkey,
     stake::{
         self,
         instruction::{self as stake_instruction, LockupArgs, StakeError},
-        state::{Authorized, Lockup, Meta, StakeAuthorize, StakeState},
+        state::{Authorized, Lockup, Meta, StakeActivationStatus, StakeAuthorize, StakeState},
     },
+    stake_history::StakeHistory,
     system_instruction::SystemError,
-    sysvar::{
-        clock,
-        stake_history::{self, StakeHistory},
-    },
+    sysvar::{clock, stake_history},
     transaction::Transaction,
 };
 use solana_vote_program::vote_state::VoteState;
@@ -1353,6 +1352,15 @@ pub fn process_stake_authorize(
 ) -> ProcessResult {
     let mut ixs = Vec::new();
     let custodian = custodian.map(|index| config.signers[index]);
+    let current_stake_account = if !sign_only {
+        Some(get_stake_account_state(
+            rpc_client,
+            stake_account_pubkey,
+            config.commitment,
+        )?)
+    } else {
+        None
+    };
     for StakeAuthorizationIndexed {
         authorization_type,
         new_authority_pubkey,
@@ -1365,6 +1373,29 @@ pub fn process_stake_authorize(
             (new_authority_pubkey, "new_authorized_pubkey".to_string()),
         )?;
         let authority = config.signers[*authority];
+        if let Some(current_stake_account) = current_stake_account {
+            let authorized = match current_stake_account {
+                StakeState::Stake(Meta { authorized, .. }, ..) => Some(authorized),
+                StakeState::Initialized(Meta { authorized, .. }) => Some(authorized),
+                _ => None,
+            };
+            if let Some(authorized) = authorized {
+                match authorization_type {
+                    StakeAuthorize::Staker => {
+                        check_current_authority(&authorized.staker, &authority.pubkey())?;
+                    }
+                    StakeAuthorize::Withdrawer => {
+                        check_current_authority(&authorized.withdrawer, &authority.pubkey())?;
+                    }
+                }
+            } else {
+                return Err(CliError::RpcRequestError(format!(
+                    "{:?} is not an Initialized or Delegated stake account",
+                    stake_account_pubkey,
+                ))
+                .into());
+            }
+        }
         if new_authority_signer.is_some() {
             ixs.push(stake_instruction::authorize_checked(
                 stake_account_pubkey, // stake account to update
@@ -1424,7 +1455,6 @@ pub fn process_stake_authorize(
         check_account_for_fee_with_commitment(
             rpc_client,
             &tx.message.account_keys[0],
-            &recent_blockhash,
             &tx.message,
             config.commitment,
         )?;
@@ -1503,7 +1533,6 @@ pub fn process_deactivate_stake_account(
         check_account_for_fee_with_commitment(
             rpc_client,
             &tx.message.account_keys[0],
-            &recent_blockhash,
             &tx.message,
             config.commitment,
         )?;
@@ -1601,7 +1630,6 @@ pub fn process_withdraw_stake(
         check_account_for_fee_with_commitment(
             rpc_client,
             &tx.message.account_keys[0],
-            &recent_blockhash,
             &tx.message,
             config.commitment,
         )?;
@@ -1745,7 +1773,6 @@ pub fn process_split_stake(
         check_account_for_fee_with_commitment(
             rpc_client,
             &tx.message.account_keys[0],
-            &recent_blockhash,
             &tx.message,
             config.commitment,
         )?;
@@ -1851,7 +1878,6 @@ pub fn process_merge_stake(
         check_account_for_fee_with_commitment(
             rpc_client,
             &tx.message.account_keys[0],
-            &recent_blockhash,
             &tx.message,
             config.commitment,
         )?;
@@ -1892,6 +1918,26 @@ pub fn process_stake_set_lockup(
     let nonce_authority = config.signers[nonce_authority];
     let fee_payer = config.signers[fee_payer];
 
+    if !sign_only {
+        let state = get_stake_account_state(rpc_client, stake_account_pubkey, config.commitment)?;
+        let lockup = match state {
+            StakeState::Stake(Meta { lockup, .. }, ..) => Some(lockup),
+            StakeState::Initialized(Meta { lockup, .. }) => Some(lockup),
+            _ => None,
+        };
+        if let Some(lockup) = lockup {
+            if lockup.custodian != Pubkey::default() {
+                check_current_authority(&lockup.custodian, &custodian.pubkey())?;
+            }
+        } else {
+            return Err(CliError::RpcRequestError(format!(
+                "{:?} is not an Initialized or Delegated stake account",
+                stake_account_pubkey,
+            ))
+            .into());
+        }
+    }
+
     let message = if let Some(nonce_account) = &nonce_account {
         Message::new_with_nonce(
             ixs,
@@ -1926,7 +1972,6 @@ pub fn process_stake_set_lockup(
         check_account_for_fee_with_commitment(
             rpc_client,
             &tx.message.account_keys[0],
-            &recent_blockhash,
             &tx.message,
             config.commitment,
         )?;
@@ -1960,7 +2005,11 @@ pub fn build_stake_state(
             stake,
         ) => {
             let current_epoch = clock.epoch;
-            let (active_stake, activating_stake, deactivating_stake) = stake
+            let StakeActivationStatus {
+                effective,
+                activating,
+                deactivating,
+            } = stake
                 .delegation
                 .stake_activating_and_deactivating(current_epoch, Some(stake_history));
             let lockup = if lockup.is_in_force(clock, None) {
@@ -1995,9 +2044,9 @@ pub fn build_stake_state(
                 use_lamports_unit,
                 current_epoch,
                 rent_exempt_reserve: Some(*rent_exempt_reserve),
-                active_stake: u64_some_if_not_zero(active_stake),
-                activating_stake: u64_some_if_not_zero(activating_stake),
-                deactivating_stake: u64_some_if_not_zero(deactivating_stake),
+                active_stake: u64_some_if_not_zero(effective),
+                activating_stake: u64_some_if_not_zero(activating),
+                deactivating_stake: u64_some_if_not_zero(deactivating),
                 ..CliStakeState::default()
             }
         }
@@ -2031,6 +2080,47 @@ pub fn build_stake_state(
                 ..CliStakeState::default()
             }
         }
+    }
+}
+
+fn get_stake_account_state(
+    rpc_client: &RpcClient,
+    stake_account_pubkey: &Pubkey,
+    commitment_config: CommitmentConfig,
+) -> Result<StakeState, Box<dyn std::error::Error>> {
+    let stake_account = rpc_client
+        .get_account_with_commitment(stake_account_pubkey, commitment_config)?
+        .value
+        .ok_or_else(|| {
+            CliError::RpcRequestError(format!("{:?} account does not exist", stake_account_pubkey))
+        })?;
+    if stake_account.owner != stake::program::id() {
+        return Err(CliError::RpcRequestError(format!(
+            "{:?} is not a stake account",
+            stake_account_pubkey,
+        ))
+        .into());
+    }
+    stake_account.state().map_err(|err| {
+        CliError::RpcRequestError(format!(
+            "Account data could not be deserialized to stake state: {}",
+            err
+        ))
+        .into()
+    })
+}
+
+pub(crate) fn check_current_authority(
+    account_current_authority: &Pubkey,
+    provided_current_authority: &Pubkey,
+) -> Result<(), CliError> {
+    if account_current_authority != provided_current_authority {
+        Err(CliError::RpcRequestError(format!(
+            "Invalid current authority provided: {:?}, expected {:?}",
+            provided_current_authority, account_current_authority
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -2323,7 +2413,6 @@ pub fn process_delegate_stake(
         check_account_for_fee_with_commitment(
             rpc_client,
             &tx.message.account_keys[0],
-            &recent_blockhash,
             &tx.message,
             config.commitment,
         )?;
