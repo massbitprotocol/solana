@@ -920,16 +920,24 @@ impl RpcClient {
             .map_err(|err| ClientError::new_with_request(err.into(), request))
     }
 
-    pub fn send_batch<T>(&self, request: RpcRequest, batch_params: Vec<Value>) -> ClientResult<T>
+    pub fn send_batch<T>(&self, request: RpcRequest, batch_params: Vec<Value>) -> ClientResult<Vec<ClientResult<T>>>
         where
             T: serde::de::DeserializeOwned,
     {
-        let response = self
+        debug!("request: {:?}", request);
+        debug!("batch_params: {:?}", batch_params);
+
+        let result_responses = self
             .sender
             .send_batch(request, batch_params)
             .map_err(|err| err.into_with_request(request))?;
-        serde_json::from_value(response)
-            .map_err(|err| ClientError::new_with_request(err.into(), request))
+
+        let response = result_responses.into_iter().map(|result_response| {
+            let _response = result_response.map_err(|err| err.into_with_request(request))?;
+            serde_json::from_value(_response)
+                .map_err(|err| ClientError::new_with_request(err.into(), request))
+        }).collect();
+        Ok(response)
     }
 
     /// Check the confirmation status of a transaction.

@@ -32,5 +32,5 @@ pub struct RpcTransportStats {
 pub trait RpcSender {
     fn send(&self, request: RpcRequest, params: serde_json::Value) -> Result<serde_json::Value>;
     fn get_transport_stats(&self) -> RpcTransportStats;
-    fn send_batch(&self, request: RpcRequest, batch_params: Vec<serde_json::Value>) -> Result<serde_json::Value>;
+    fn send_batch(&self, request: RpcRequest, batch_params: Vec<serde_json::Value>) -> Result<Vec<Result<serde_json::Value>>>;
 }

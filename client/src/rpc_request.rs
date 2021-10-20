@@ -216,10 +216,11 @@ impl RpcRequest {
         let jsonrpc = "2.0";
         let mut index = id;
         let mut batch_request = vec![];
-        batch_params.into_iter().map(|params|{
-            batch_request.push(self.build_request_json(index,params));
-            index+=1;
-        });
+        for params in batch_params.into_iter() {
+            let request_json = self.build_request_json(index, params);
+            batch_request.push(request_json);
+            index += 1;
+        }
         json!(batch_request)
     }
 }

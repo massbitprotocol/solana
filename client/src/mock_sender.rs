@@ -460,7 +460,7 @@ impl RpcSender for MockSender {
         };
         Ok(val)
     }
-    fn send_batch(&self, request: RpcRequest, batch_params: Vec<serde_json::Value>) -> Result<serde_json::Value>{
+    fn send_batch(&self, request: RpcRequest, batch_params: Vec<serde_json::Value>) -> Result<Vec<Result<serde_json::Value>>>{
         unimplemented!()
     }
 }
